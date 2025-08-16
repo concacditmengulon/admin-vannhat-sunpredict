@@ -1,14 +1,16 @@
 {
-  "name": "vip-ultimate-api",
+  "name": "vip-taixiu-api",
   "version": "1.0.0",
-  "description": "API for VIP-Ultimate Tai-Xiu prediction model",
+  "description": "VIP99+ Tài/Xỉu API — phân tích & dự đoán tài xỉu với Ensemble, Ridge, GBDT",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "axios": "^1.7.2",
-    "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "ml-regression-multivariate-linear": "^2.0.2",
+    "ml-cart": "^3.1.1",
+    "cors": "^2.8.5"
   }
 }
