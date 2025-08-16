@@ -1,8 +1,11 @@
 /**
- * VIP99+ Tai/Xiu API — Node.js (Express)
- * Nguồn dữ liệu: https://fullsrc-daynesun.onrender.com/api/taixiu/history
- * Trả về: phien, xuc_xac, tong, ket_qua, phien_sau, du_doan, ty_le_thanh_cong (backtest),
- *         giai_thich, muc_do_rui_ro
+ * VIP-Ultimate — nâng cấp so với VIP99+
+ * - Thêm models: pattern (triple/pair/straight), parity, bucket (tổng range)
+ * - Tính entropy, transition matrix, run-length
+ * - Tối ưu trọng số bằng hill-climb dựa trên backtest walk-forward
+ * - Trả về giai_thich chi tiết: per-model stats, pattern stats, entropy, transitions, streak
+ *
+ * Lưu ý: Càng nhiều lịch sử (samples) càng đáng tin. Không thể đảm bảo 100% thắng.
  */
 
 const express = require("express");
@@ -17,7 +20,6 @@ app.use(cors());
 app.use(express.json());
 
 // ---------------------- UTILS ----------------------
-
 function normResult(v) {
   if (v == null) return null;
   const s = String(v).trim().toLowerCase();
@@ -25,7 +27,6 @@ function normResult(v) {
   if (["x", "xiu", "xỉu", "xỉu"].includes(s)) return "X";
   return null;
 }
-
 function lastN(arr, n) {
   return arr.slice(-n);
 }
@@ -33,11 +34,9 @@ function avg(arr) {
   if (!arr.length) return 0;
   return arr.reduce((a, b) => a + b, 0) / arr.length;
 }
-
 function sum(arr) {
   return arr.reduce((a, b) => a + b, 0);
 }
-
 function streakOfEnd(arr) {
   if (!arr.length) return 0;
   const last = arr[arr.length - 1];
@@ -48,13 +47,21 @@ function streakOfEnd(arr) {
   }
   return s;
 }
+function shannonEntropy(arr) {
+  if (!arr.length) return 0;
+  const freq = {};
+  arr.forEach((x) => (freq[x] = (freq[x] || 0) + 1));
+  const n = arr.length;
+  let ent = 0;
+  Object.values(freq).forEach((c) => {
+    const p = c / n;
+    ent -= p * Math.log2(p);
+  });
+  return ent; // bits
+}
 
-// ---------------------- LAYER 0: LOAD & SHAPE ----------------------
-
+// ---------------------- SHAPE ----------------------
 function shapeHistory(raw) {
-  // Kỳ vọng mỗi phần tử có: Phien, Xuc_xac_1, Xuc_xac_2, Xuc_xac_3, Tong, Ket_qua
-  // Trả về mảng lịch sử chuẩn hoá:
-  // { phien, dice:[a,b,c], tong, ket_qua:'T'|'X' }
   if (!Array.isArray(raw)) return [];
   return raw
     .filter(
@@ -71,17 +78,69 @@ function shapeHistory(raw) {
       phien: Number(r.Phien),
       dice: [Number(r.Xuc_xac_1), Number(r.Xuc_xac_2), Number(r.Xuc_xac_3)],
       tong: Number(r.Tong),
-      ket_qua: normResult(r.Ket_qua), // 'T' or 'X'
+      ket_qua: normResult(r.Ket_qua),
       raw: r,
     }))
     .filter((r) => r.ket_qua === "T" || r.ket_qua === "X")
-    .sort((a, b) => a.phien - b.phien); // đảm bảo tăng dần theo phiên
+    .sort((a, b) => a.phien - b.phien);
 }
 
-// ---------------------- LAYER 1: RULES (Ưu tiên bên mạnh) ----------------------
+// ---------------------- FEATURE EXTRACTORS ----------------------
+function getPatternType(entry) {
+  const [a, b, c] = entry.dice;
+  if (a === b && b === c) return `triple_${a}`;
+  if (a === b || b === c || a === c) return "pair";
+  const s = [a, b, c].sort((x, y) => x - y);
+  if (s[0] + 1 === s[1] && s[1] + 1 === s[2]) return "straight";
+  return "diff";
+}
+function parityBucket(entry) {
+  return entry.tong % 2 === 0 ? "even" : "odd";
+}
+function sumBucket(entry) {
+  const t = entry.tong;
+  if (t <= 6) return "<=6";
+  if (t <= 9) return "7-9";
+  if (t <= 12) return "10-12";
+  if (t <= 15) return "13-15";
+  return ">=16";
+}
 
+// ---------------------- GENERIC CONDITIONAL MODEL ----------------------
+function conditionalModel(hist, extractor, name, minCount = 6) {
+  // build table: key -> counts next T/X
+  const table = {};
+  for (let i = 0; i < hist.length - 1; i++) {
+    const key = extractor(hist[i]);
+    const next = hist[i + 1].ket_qua;
+    if (!table[key]) table[key] = { T: 0, X: 0, total: 0 };
+    table[key][next] += 1;
+    table[key].total += 1;
+  }
+  const lastKey = extractor(hist[hist.length - 1]);
+  const data = table[lastKey] || null;
+  if (!data || data.total < minCount) {
+    return {
+      pred: null,
+      conf: 0.5,
+      why: [`${name}: không có đủ mẫu cho key=${lastKey} (samples=${data ? data.total : 0})`],
+      meta: { key: lastKey, samples: data ? data.total : 0 },
+    };
+  }
+  const pT = data.T / data.total;
+  const pred = pT >= 0.5 ? "T" : "X";
+  // conf mapping: if pT=0.5 -> 0.55, if pT=0.9 -> 0.9
+  const conf = 0.55 + Math.min(0.35, Math.abs(pT - 0.5) * 1.2);
+  return {
+    pred,
+    conf,
+    why: [`${name}: key=${lastKey}, P(T)=${pT.toFixed(3)} over ${data.total} samples`],
+    meta: { key: lastKey, samples: data.total, pT },
+  };
+}
+
+// ---------------------- EXISTING MODELS (refined) ----------------------
 function rulesPrediction(hist) {
-  // Hist: array các bản ghi chuẩn hoá
   const results = hist.map((h) => h.ket_qua);
   const totals = hist.map((h) => h.tong);
   const last = results.at(-1);
@@ -93,33 +152,25 @@ function rulesPrediction(hist) {
   let explain = [];
   let score = { T: 0, X: 0 };
 
-  // 1-2. 5 phiên gần nhất lệch
   if (last5.filter((r) => r === "T").length >= 4) {
-    return { pred: "T", conf: 0.86, why: ["5 phiên gần nhất nghiêng Tài (≥4/5)"] };
+    return { pred: "T", conf: 0.92, why: ["5 phiên gần nhất nghiêng Tài (≥4/5)"], meta: { rule: "5/5 bias" } };
   }
   if (last5.filter((r) => r === "X").length >= 4) {
-    return { pred: "X", conf: 0.86, why: ["5 phiên gần nhất nghiêng Xỉu (≥4/5)"] };
+    return { pred: "X", conf: 0.92, why: ["5 phiên gần nhất nghiêng Xỉu (≥4/5)"], meta: { rule: "5/5 bias" } };
   }
 
-  // 3. 3 phiên liên tục => đảo cầu
   if (last3.length === 3 && last3.every((r) => r === "T")) {
-    return { pred: "X", conf: 0.8, why: ["3 Tài liên tiếp → ưu tiên đảo Xỉu"] };
+    return { pred: "X", conf: 0.86, why: ["3 Tài liên tiếp → ưu tiên đảo Xỉu"], meta: { rule: "3-in-a-row-break" } };
   }
   if (last3.length === 3 && last3.every((r) => r === "X")) {
-    return { pred: "T", conf: 0.8, why: ["3 Xỉu liên tiếp → ưu tiên đảo Tài"] };
+    return { pred: "T", conf: 0.86, why: ["3 Xỉu liên tiếp → ưu tiên đảo Tài"], meta: { rule: "3-in-a-row-break" } };
   }
 
-  // 4. Zigzag T-X-T-X-T
   const zigzag = last5.length === 5 && last5.every((v, i, arr) => i === 0 || v !== arr[i - 1]);
   if (zigzag) {
-    return {
-      pred: last === "T" ? "X" : "T",
-      conf: 0.78,
-      why: ["Cầu zigzag rõ ràng → lặp tiếp"],
-    };
+    return { pred: last === "T" ? "X" : "T", conf: 0.82, why: ["Cầu zigzag rõ ràng → đảo lặp"], meta: { rule: "zigzag" } };
   }
 
-  // 5. Trung bình tổng gần
   const avg5 = total5.length ? avg(total5) : 10.5;
   if (avg5 >= 12) {
     score.T += 2;
@@ -129,300 +180,321 @@ function rulesPrediction(hist) {
     explain.push("Trung bình tổng 5 phiên thấp (≤9.5) → Xỉu");
   }
 
-  // 6. Tổng tăng/giảm 3 phiên
   if (total3.length === 3) {
     if (total3[2] > total3[1] && total3[1] > total3[0]) {
-      score.T += 2;
-      explain.push("Tổng tăng đều 3 phiên → nghiêng Tài");
+      score.T += 2; explain.push("Đà tăng 3 phiên → Tài");
     } else if (total3[2] < total3[1] && total3[1] < total3[0]) {
-      score.X += 2;
-      explain.push("Tổng giảm đều 3 phiên → nghiêng Xỉu");
+      score.X += 2; explain.push("Đà giảm 3 phiên → Xỉu");
     }
   }
 
-  // 7-9. Cực trị và đồng nhất
   const lastTotal = totals.at(-1) ?? 10;
-  if (lastTotal >= 17) {
-    score.T += 3;
-    explain.push("Tổng gần nhất rất cao (≥17) → Tài mạnh");
-  }
-  if (lastTotal <= 6) {
-    score.X += 3;
-    explain.push("Tổng gần nhất rất thấp (≤6) → Xỉu mạnh");
-  }
-  if (total5.length === 5 && total5.every((t) => t >= 12)) {
-    score.T += 3;
-    explain.push("5 phiên liên tiếp tổng cao (≥12) → Tài");
-  }
-  if (total5.length === 5 && total5.every((t) => t <= 9)) {
-    score.X += 3;
-    explain.push("5 phiên liên tiếp tổng thấp (≤9) → Xỉu");
+  if (lastTotal >= 17) { score.T += 3; explain.push("Tổng cực cao (≥17) → Tài"); }
+  if (lastTotal <= 6) { score.X += 3; explain.push("Tổng cực thấp (≤6) → Xỉu"); }
+  if (total5.length === 5 && total5.every((t) => t >= 12)) { score.T += 3; explain.push("5 tổng cao liên tiếp → Tài"); }
+  if (total5.length === 5 && total5.every((t) => t <= 9)) { score.X += 3; explain.push("5 tổng thấp liên tiếp → Xỉu"); }
+
+  let pred = null, conf = 0.6;
+  if (score.T > score.X) { pred = "T"; conf = 0.68 + Math.min(0.25, (score.T - score.X) * 0.06); }
+  else if (score.X > score.T) { pred = "X"; conf = 0.68 + Math.min(0.25, (score.X - score.T) * 0.06); }
+  else {
+    if (avg5 >= 11) { pred = "T"; conf = 0.64; explain.push("Bias theo avg"); }
+    else if (avg5 <= 10) { pred = "X"; conf = 0.64; explain.push("Bias theo avg"); }
+    else { pred = last === "T" ? "X" : "T"; conf = 0.6; explain.push("Không nghiêng → đảo"); }
   }
 
-  let pred = null;
-  let conf = 0.62;
-  if (score.T > score.X) {
-    pred = "T";
-    conf = 0.68 + Math.min(0.12, (score.T - score.X) * 0.04);
-    explain.push("Điểm score nghiêng Tài");
-  } else if (score.X > score.T) {
-    pred = "X";
-    conf = 0.68 + Math.min(0.12, (score.X - score.T) * 0.04);
-    explain.push("Điểm score nghiêng Xỉu");
-  } else {
-    // Bias theo avg5
-    if (avg5 >= 11) {
-      pred = "T";
-      conf = 0.64;
-      explain.push("Score cân bằng → bias tổng cao → Tài");
-    } else if (avg5 <= 10) {
-      pred = "X";
-      conf = 0.64;
-      explain.push("Score cân bằng → bias tổng thấp → Xỉu");
-    } else {
-      pred = last === "T" ? "X" : "T";
-      conf = 0.6;
-      explain.push("Không nghiêng rõ → đảo chiều so với gần nhất");
+  return { pred, conf, why: explain.length ? explain : ["Rules fallback"], meta: { avg5, lastTotal }};
+}
+
+// Markov (giữ như trước)
+function markovPrediction(hist) {
+  const rs = hist.map((h) => h.ket_qua);
+  const use = lastN(rs, 80);
+  let tt = 1, tx = 1, xt = 1, xx = 1;
+  for (let i = 1; i < use.length; i++) {
+    const p = use[i - 1], c = use[i];
+    if (p === "T" && c === "T") tt++; if (p === "T" && c === "X") tx++;
+    if (p === "X" && c === "T") xt++; if (p === "X" && c === "X") xx++;
+  }
+  const last = use.at(-1);
+  let pT = 0.5, pX = 0.5, why = [];
+  if (last === "T") { pT = tt / (tt + tx); pX = tx / (tt + tx); why.push(`Markov từ T: P(T)=${pT.toFixed(2)}`); }
+  else { pT = xt / (xt + xx); pX = xx / (xt + xx); why.push(`Markov từ X: P(T)=${pT.toFixed(2)}`); }
+  const pred = pT >= pX ? "T" : "X";
+  const conf = 0.58 + Math.min(0.35, Math.abs(pT - pX) * 1.2);
+  return { pred, conf, why, meta: { tt, tx, xt, xx }};
+}
+
+// recent pattern (improved)
+function recentPatternPrediction(hist) {
+  const rs = hist.map((h) => h.ket_qua);
+  const use = lastN(rs, 30);
+  const patCounts = {};
+  for (let L = 3; L <= 5; L++) {
+    for (let i = 0; i <= use.length - L; i++) {
+      const k = use.slice(i, i + L).join("");
+      patCounts[k] = (patCounts[k] || 0) + 1;
     }
   }
-
-  return { pred, conf, why: explain };
-}
-
-// ---------------------- LAYER 2: MÔ HÌNH "HỌC" ĐƠN GIẢN ----------------------
-
-function markovPrediction(hist) {
-  // Xây ma trận chuyển T→T, T→X, X→T, X→X từ 60 phiên gần nhất
-  const rs = hist.map((h) => h.ket_qua);
-  const use = lastN(rs, 60);
-  let tt = 1,
-    tx = 1,
-    xt = 1,
-    xx = 1; // +1 smoothing
-
-  for (let i = 1; i < use.length; i++) {
-    const prev = use[i - 1];
-    const cur = use[i];
-    if (prev === "T" && cur === "T") tt++;
-    if (prev === "T" && cur === "X") tx++;
-    if (prev === "X" && cur === "T") xt++;
-    if (prev === "X" && cur === "X") xx++;
+  const entries = Object.entries(patCounts).sort((a, b) => b[1] - a[1]);
+  if (!entries.length) return { pred: null, conf: 0.5, why: ["Không pattern mạnh"] };
+  const [bestPat, cnt] = entries[0];
+  // bestPat dạng "TXT..." -> dự đoán next char = last char of pattern? heuristic: if pattern appears with continuation often -> choose continuation
+  // We will check occurrences where the pattern was followed by a next result
+  const follow = { T: 0, X: 0, total: 0 };
+  for (let i = 0; i <= rs.length - bestPat.length - 1; i++) {
+    if (rs.slice(i, i + bestPat.length).join("") === bestPat) {
+      const next = rs[i + bestPat.length];
+      follow[next]++; follow.total++;
+    }
   }
-
-  const last = use.at(-1);
-  let pT = 0.5,
-    pX = 0.5,
-    why = [];
-  if (last === "T") {
-    const s = tt + tx;
-    pT = tt / s;
-    pX = tx / s;
-    why.push(`Markov từ T: P(T)=${pT.toFixed(2)}, P(X)=${pX.toFixed(2)}`);
-  } else if (last === "X") {
-    const s = xt + xx;
-    pT = xt / s;
-    pX = xx / s;
-    why.push(`Markov từ X: P(T)=${pT.toFixed(2)}, P(X)=${pX.toFixed(2)}`);
-  }
-
-  const pred = pT >= pX ? "T" : "X";
-  const conf = Math.max(pT, pX); // 0.5 ~ 1
-  return { pred, conf: 0.6 + (conf - 0.5) * 0.8, why };
-}
-
-function recentPatternPrediction(hist) {
-  // Tìm mẫu ngắn 3-4 bước lặp trong 20 phiên (pattern mining đơn giản)
-  const rs = hist.map((h) => h.ket_qua);
-  const use = lastN(rs, 20);
-  let why = [];
-
-  const pat3Counts = {};
-  for (let i = 0; i <= use.length - 3; i++) {
-    const k = use.slice(i, i + 3).join("");
-    pat3Counts[k] = (pat3Counts[k] || 0) + 1;
-  }
-  const pat4Counts = {};
-  for (let i = 0; i <= use.length - 4; i++) {
-    const k = use.slice(i, i + 4).join("");
-    pat4Counts[k] = (pat4Counts[k] || 0) + 1;
-  }
-
-  function bestEntry(obj) {
-    return Object.entries(obj).sort((a, b) => b[1] - a[1])[0];
-  }
-
-  const b3 = bestEntry(pat3Counts);
-  const b4 = bestEntry(pat4Counts);
-
-  // Chọn pattern xuất hiện nhiều
-  let pred = null;
-  let conf = 0.58;
-
-  if (b4 && b4[1] >= 3) {
-    // lấy 3 ký tự đầu của pattern 4, dự đoán bước tiếp theo theo pattern
-    const patt = b4[0];
-    const next = patt[3]; // ký tự thứ 4 của mẫu thường là “tiếp theo” trong cụm
-    pred = next === "T" ? "T" : "X";
-    conf = 0.72 + Math.min(0.12, (b4[1] - 3) * 0.04);
-    why.push(`Pattern 4 bước lặp nhiều: ${patt} x${b4[1]}`);
-  } else if (b3 && b3[1] >= 4) {
-    const patt = b3[0];
-    const next = patt[2];
-    pred = next === "T" ? "T" : "X";
-    conf = 0.68 + Math.min(0.1, (b3[1] - 4) * 0.03);
-    why.push(`Pattern 3 bước lặp nhiều: ${patt} x${b3[1]}`);
-  } else {
-    // fallback: dựa vào tỉ lệ gần đây có trọng số
-    const weights = use.map((_, i) => Math.pow(1.15, i));
+  if (follow.total < 4) {
+    // fallback to weighted recent
+    const weights = use.map((_, i) => Math.pow(1.12, i));
     const tScore = use.reduce((s, v, i) => s + (v === "T" ? weights[i] : 0), 0);
     const xScore = use.reduce((s, v, i) => s + (v === "X" ? weights[i] : 0), 0);
-    pred = tScore >= xScore ? "T" : "X";
+    const pred = tScore >= xScore ? "T" : "X";
     const dom = Math.abs(tScore - xScore) / (tScore + xScore);
-    conf = 0.6 + Math.min(0.2, dom * 0.8);
-    why.push("Trọng số gần đây nghiêng " + (pred === "T" ? "Tài" : "Xỉu"));
+    const conf = 0.6 + Math.min(0.28, dom * 0.9);
+    return { pred, conf, why: ["No strong follow; fallback weighted recent"], meta: { bestPat, cnt } };
   }
-
-  return { pred, conf, why };
+  const pT = follow.T / follow.total;
+  const pred = pT >= 0.5 ? "T" : "X";
+  const conf = 0.6 + Math.min(0.36, Math.abs(pT - 0.5) * 1.3);
+  return { pred, conf, why: [`Pattern ${bestPat} x${cnt}, follow: P(T)=${pT.toFixed(3)} (${follow.total} samples)`], meta: { bestPat, cnt, follow } };
 }
 
+// breakStreakFilter (refined)
 function breakStreakFilter(hist) {
-  // Nếu bệt dài → cân nhắc bẻ cầu theo xác suất
   const rs = hist.map((h) => h.ket_qua);
   const s = streakOfEnd(rs);
-  const cur = rs.at(-1); // kết quả hiện tại
-
+  const cur = rs.at(-1);
   let breakProb = 0;
-  if (s >= 8) breakProb = 0.78;
-  else if (s >= 6) breakProb = 0.7;
+  if (s >= 10) breakProb = 0.82;
+  else if (s >= 8) breakProb = 0.76;
+  else if (s >= 6) breakProb = 0.68;
   else if (s >= 4) breakProb = 0.62;
-
   if (breakProb >= 0.62) {
     const pred = cur === "T" ? "X" : "T";
-    return {
-      pred,
-      conf: breakProb,
-      why: [`Chuỗi ${s} ${cur === "T" ? "Tài" : "Xỉu"} → xác suất bẻ cầu ${Math.round(breakProb * 100)}%`],
-    };
+    return { pred, conf: breakProb, why: [`Chuỗi ${s} ${cur === "T" ? "Tài" : "Xỉu"} → khả năng bẻ cầu ${Math.round(breakProb * 100)}%`], meta: { streak: s } };
   }
-  // nếu không bẻ, đề xuất giữ tiếp
-  return {
-    pred: cur,
-    conf: 0.55,
-    why: [`Chuỗi ${s} chưa đủ dài để bẻ → theo cầu`],
-  };
+  return { pred: cur, conf: 0.56, why: [`Chuỗi ${s} → theo cầu`], meta: { streak: s } };
 }
 
-// ---------------------- LAYER 3: ENSEMBLE ----------------------
-
-function ensemblePredict(hist) {
-  const r1 = rulesPrediction(hist);
-  const r2 = markovPrediction(hist);
-  const r3 = recentPatternPrediction(hist);
-  const r4 = breakStreakFilter(hist);
-
-  // Trọng số động theo hiệu suất gần đây (tự đánh giá nhanh trong 30 phiên cuối)
-  const perf = localPerformance(hist, 30, [rulesPrediction, markovPrediction, recentPatternPrediction, breakStreakFilter]);
-
-  const weights = [
-    0.28 * perf[0], // rules
-    0.24 * perf[1], // markov
-    0.28 * perf[2], // pattern
-    0.20 * perf[3], // breakStreak
-  ];
-
-  const votes = [
-    { p: r1.pred, c: r1.conf * weights[0], why: r1.why },
-    { p: r2.pred, c: r2.conf * weights[1], why: r2.why },
-    { p: r3.pred, c: r3.conf * weights[2], why: r3.why },
-    { p: r4.pred, c: r4.conf * weights[3], why: r4.why },
-  ];
-
-  const scoreT = sum(votes.map((v) => (v.p === "T" ? v.c : 0)));
-  const scoreX = sum(votes.map((v) => (v.p === "X" ? v.c : 0)));
-  const pred = scoreT >= scoreX ? "T" : "X";
-
-  const rawConf = Math.max(scoreT, scoreX) / (scoreT + scoreX || 1);
-  // Điều chỉnh nhẹ theo độ đồng thuận
-  const agree = votes.filter((v) => v.p === pred).length / votes.length; // 0..1
-  const conf = Math.min(0.99, 0.65 + (rawConf - 0.5) * 0.7 + agree * 0.12);
-
-  const why = votes
-    .filter((v) => v.p === pred)
-    .flatMap((v) => v.why)
-    .concat([`Đồng thuận ${Math.round(agree * 100)}% giữa các lớp`]);
-
-  return { pred, conf, why };
+// ---------------------- NEW MODELS (pattern/parity/bucket) ----------------------
+function patternConditionalModel(hist) {
+  return conditionalModel(hist, getPatternType, "DicePattern", 5);
+}
+function parityConditionalModel(hist) {
+  return conditionalModel(hist, parityBucket, "ParityPrevSum", 8);
+}
+function bucketConditionalModel(hist) {
+  return conditionalModel(hist, sumBucket, "SumBucket", 8);
 }
 
+// ---------------------- MODEL LIST ----------------------
+const modelFns = [
+  { name: "Rules", fn: rulesPrediction },
+  { name: "Markov", fn: markovPrediction },
+  { name: "PatternMining", fn: recentPatternPrediction },
+  { name: "BreakStreak", fn: breakStreakFilter },
+  { name: "DicePattern", fn: patternConditionalModel },
+  { name: "Parity", fn: parityConditionalModel },
+  { name: "SumBucket", fn: bucketConditionalModel },
+];
+
+// ---------------------- LOCAL PERFORMANCE (backtest per-model) ----------------------
 function localPerformance(hist, lookback, models) {
-  // Backtest nhanh cho từng model trong lookback phiên:
-  // dự đoán phiên i dựa vào lịch sử < i
   const n = Math.min(lookback, hist.length - 1);
-  if (n <= 5) return models.map(() => 1.0); // không đủ dữ liệu, neutral
-
-  const start = hist.length - 1 - n; // index bắt đầu
+  if (n <= 8) return models.map(() => 1.0);
+  const start = hist.length - 1 - n;
   const correct = new Array(models.length).fill(0);
   const count = n;
-
   for (let i = start; i < hist.length - 1; i++) {
-    const past = hist.slice(0, i + 1); // lịch sử đến i
+    const past = hist.slice(0, i + 1);
     const actualNext = hist[i + 1].ket_qua;
-    models.forEach((fn, idx) => {
-      const { pred } = fn(past);
+    models.forEach((m, idx) => {
+      const { pred } = m.fn(past);
       if (pred === actualNext) correct[idx]++;
     });
   }
-
-  // chuyển thành hệ số 0.8 ~ 1.2 để nhân trọng số
   return correct.map((c) => {
-    const acc = c / count; // 0..1
-    return 0.8 + Math.min(0.4, Math.max(0, (acc - 0.5) * 0.8)); // 0.8..1.2
+    const acc = c / count;
+    return 0.75 + Math.min(0.6, Math.max(0, (acc - 0.5) * 1.2)); // 0.75..1.35
   });
 }
 
-// ---------------------- BACKTEST CHUNG (tỷ lệ thành công) ----------------------
-
-function overallBacktest(hist, lookback = 80) {
+// ---------------------- BACKTEST EVALUATOR FOR WEIGHT OPTIMIZER ----------------------
+function evaluateWeights(hist, models, weights, lookback) {
   const n = Math.min(lookback, hist.length - 1);
-  if (n <= 10) return { acc: 0.62, sample: n }; // không đủ dữ liệu
-
+  if (n <= 10) return 0.5;
   let correct = 0;
-  for (let i = hist.length - 1 - n; i < hist.length - 1; i++) {
+  const start = hist.length - 1 - n;
+  for (let i = start; i < hist.length - 1; i++) {
     const past = hist.slice(0, i + 1);
     const actualNext = hist[i + 1].ket_qua;
-    const { pred } = ensemblePredict(past);
+    // collect votes
+    let scoreT = 0, scoreX = 0;
+    for (let k = 0; k < models.length; k++) {
+      const { pred, conf } = models[k].fn(past);
+      const w = weights[k];
+      if (!pred) continue;
+      if (pred === "T") scoreT += conf * w;
+      else scoreX += conf * w;
+    }
+    const final = scoreT >= scoreX ? "T" : "X";
+    if (final === actualNext) correct++;
+  }
+  return correct / n;
+}
+
+// simple hill-climb optimizer
+function optimizeWeights(hist, models, lookback = 80, iter = 300) {
+  const base = models.map(() => 1.0);
+  let weights = base.slice();
+  let best = { weights: weights.slice(), acc: evaluateWeights(hist, models, weights, lookback) };
+  for (let it = 0; it < iter; it++) {
+    const j = Math.floor(Math.random() * weights.length);
+    const old = weights[j];
+    const factor = 1 + (Math.random() - 0.5) * 0.6; // +-30%
+    weights[j] = Math.max(0.2, Math.min(3.0, weights[j] * factor));
+    const acc = evaluateWeights(hist, models, weights, lookback);
+    if (acc >= best.acc) {
+      best = { weights: weights.slice(), acc };
+      // keep
+    } else {
+      weights[j] = old;
+    }
+  }
+  return best;
+}
+
+// ---------------------- ENSEMBLE (with optimization) ----------------------
+function ensemblePredictOptimized(hist) {
+  // compute per-model outputs now
+  const modelOutputs = modelFns.map((m) => {
+    const out = m.fn(hist);
+    return { name: m.name, pred: out.pred, conf: out.conf || 0.5, why: out.why || [], meta: out.meta || {} };
+  });
+
+  // baseline perf multipliers
+  const perf = localPerformance(hist, 60, modelFns);
+  // initial weights = baseline perf * predefined importance
+  const baseImportance = [1.2, 1.0, 1.1, 0.9, 1.0, 0.9, 0.9]; // tune
+  let initWeights = modelFns.map((_, i) => baseImportance[i] * perf[i]);
+
+  // optimize multipliers on recent backtest (walk-forward last 120)
+  const opt = optimizeWeights(hist, modelFns, Math.min(120, hist.length - 1), 300);
+  // multiply
+  const finalWeights = initWeights.map((w, i) => w * opt.weights[i]);
+
+  // compute votes
+  let scoreT = 0, scoreX = 0;
+  const modelStats = [];
+  for (let i = 0; i < modelFns.length; i++) {
+    const mo = modelOutputs[i];
+    const w = finalWeights[i] || 0.001;
+    const vote = (mo.conf || 0.5) * w;
+    if (mo.pred === "T") scoreT += vote;
+    else if (mo.pred === "X") scoreX += vote;
+    modelStats.push({
+      name: mo.name,
+      pred: mo.pred,
+      conf: Math.round((mo.conf || 0.5) * 100) + "%",
+      weight: Number(w.toFixed(3)),
+      voteScore: Number(vote.toFixed(3)),
+      why: mo.why,
+      meta: mo.meta || {},
+    });
+  }
+
+  const pred = scoreT >= scoreX ? "T" : "X";
+  const rawConf = Math.max(scoreT, scoreX) / (scoreT + scoreX || 1);
+  // calibrate conf by backtest opt.acc (how well weights performed)
+  const calibratedConf = Math.min(0.995, 0.6 + (rawConf - 0.5) * 0.75 + opt.acc * 0.35);
+  // assemble detailed explanation
+  const agree = modelStats.filter((m) => m.pred === pred).length / modelStats.length;
+  const why = [
+    `Final vote: T=${scoreT.toFixed(3)}, X=${scoreX.toFixed(3)} (agree ${Math.round(agree * 100)}%)`,
+    `Optimized weights backtest acc=${(opt.acc * 100).toFixed(1)}% over recent window`,
+  ];
+
+  // additional diagnostics
+  const rs = hist.map((h) => h.ket_qua);
+  const ent = shannonEntropy(lastN(rs, 30));
+  const streak = streakOfEnd(rs);
+  // transition matrix
+  const transitions = { "T->T": 0, "T->X": 0, "X->T": 0, "X->X": 0, total: 0 };
+  for (let i = 1; i < rs.length; i++) {
+    transitions[`${rs[i - 1]}->${rs[i]}`] += 1;
+    transitions.total++;
+  }
+  const transProb = {};
+  ["T->T", "T->X", "X->T", "X->X"].forEach((k) => {
+    transProb[k] = transitions.total ? (transitions[k] / transitions.total).toFixed(3) : "0.000";
+  });
+
+  // gather pattern stats (top patterns)
+  const patterns = {};
+  for (let i = 0; i < hist.length; i++) {
+    const p = getPatternType(hist[i]);
+    patterns[p] = (patterns[p] || 0) + 1;
+  }
+  const patternList = Object.entries(patterns).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({ pattern: k, count: v }));
+
+  return {
+    pred,
+    conf: calibratedConf,
+    modelStats,
+    why,
+    diagnostics: {
+      entropy_last30: Number(ent.toFixed(3)),
+      streak,
+      transitions: transProb,
+      top_patterns: patternList.slice(0, 6),
+      optimized_weights: opt.weights.map((w) => Number(w.toFixed(3))),
+      optimized_acc: Number((opt.acc * 100).toFixed(2)),
+    },
+  };
+}
+
+// ---------------------- BACKTEST (overall) ----------------------
+function overallBacktest(hist, lookback = 120) {
+  const n = Math.min(lookback, hist.length - 1);
+  if (n <= 10) return { acc: 0.58, sample: n };
+  let correct = 0;
+  const start = hist.length - 1 - n;
+  for (let i = start; i < hist.length - 1; i++) {
+    const past = hist.slice(0, i + 1);
+    const actualNext = hist[i + 1].ket_qua;
+    const { pred } = ensemblePredictOptimized(past);
     if (pred === actualNext) correct++;
   }
   return { acc: correct / n, sample: n };
 }
 
-// ---------------------- RISK LEVEL ----------------------
-
+// ---------------------- RISK LEVEL (updated) ----------------------
 function riskLevel(conf, hist) {
-  // Điều chỉnh theo biến động gần đây (switch rate) và chuỗi bệt
   const rs = hist.map((h) => h.ket_qua);
   const last12 = lastN(rs, 12);
   let switches = 0;
-  for (let i = 1; i < last12.length; i++) {
-    if (last12[i] !== last12[i - 1]) switches++;
-  }
+  for (let i = 1; i < last12.length; i++) if (last12[i] !== last12[i - 1]) switches++;
   const switchRate = last12.length > 1 ? switches / (last12.length - 1) : 0.5;
   const s = streakOfEnd(rs);
-
-  let risk = 1 - conf; // conf cao → rủi ro thấp
-  risk += switchRate * 0.15;
-  if (s >= 6) risk += 0.05; // bệt dài có thể bẻ ngược khó lường
-
-  if (risk <= 0.22) return "Thấp";
+  let risk = 1 - conf;
+  risk += switchRate * 0.12;
+  if (s >= 6) risk += 0.06;
+  const ent = shannonEntropy(lastN(rs, 30));
+  // entropy high -> unpredictable -> increase risk
+  risk += Math.min(0.12, ent / 4);
+  if (risk <= 0.20) return "Thấp";
   if (risk <= 0.35) return "Trung bình";
   return "Cao";
 }
 
 // ---------------------- API ROUTES ----------------------
-
 app.get("/health", (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
-// API đơn: dự đoán phiên kế tiếp dựa trên phiên mới nhất
 app.get("/api/du-doan", async (req, res) => {
   try {
     const { data } = await axios.get(SOURCE_URL, { timeout: 15000 });
@@ -430,9 +502,25 @@ app.get("/api/du-doan", async (req, res) => {
     if (!hist.length) return res.status(502).json({ error: "Không lấy được dữ liệu nguồn" });
 
     const last = hist.at(-1);
-    const { pred, conf, why } = ensemblePredict(hist);
-    const bt = overallBacktest(hist, 100); // backtest 100 phiên gần nhất nếu có
-    const tyLe = Math.round(bt.acc * 100); // không random, theo backtest
+    const ensemble = ensemblePredictOptimized(hist);
+    const bt = overallBacktest(hist, 160);
+    const tyLe = Math.round(bt.acc * 100);
+
+    // build giai_thich chi tiết
+    const modelLines = ensemble.modelStats.map((m) => {
+      return `${m.name}: pred=${m.pred === "T" ? "Tài" : m.pred === "X" ? "Xỉu" : "?"}, conf=${m.conf}, weight=${m.weight}, note=${(m.why || []).join("; ")}`;
+    });
+
+    const giai_thich = [
+      `Kết luận chính: ${ensemble.pred === "T" ? "Tài" : "Xỉu"} (conf ~ ${(ensemble.conf * 100).toFixed(1)}%)`,
+      `Backtest tổng (walk-forward ${bt.sample} mẫu): accuracy=${(bt.acc * 100).toFixed(1)}%`,
+      `Mô hình & đóng góp (từng lớp):`,
+      ...modelLines,
+      `Diagnostics: entropy_last30=${ensemble.diagnostics.entropy_last30}, streak=${ensemble.diagnostics.streak}`,
+      `Transitions (empirical): ${Object.entries(ensemble.diagnostics.transitions).map(([k, v]) => `${k}=${v}`).join(", ")}`,
+      `Top patterns (dice): ${ensemble.diagnostics.top_patterns.map(p => `${p.pattern}(${p.count})`).join(", ")}`,
+      `Ghi chú tối ưu: optimized weights (multi)=${ensemble.diagnostics.optimized_weights.join(", ")}, optimized_acc=${ensemble.diagnostics.optimized_acc}%`,
+    ].join(" | ");
 
     const out = {
       phien: last.phien,
@@ -440,24 +528,28 @@ app.get("/api/du-doan", async (req, res) => {
       tong: last.tong,
       ket_qua: last.ket_qua === "T" ? "Tài" : "Xỉu",
       phien_sau: last.phien + 1,
-      du_doan: pred === "T" ? "Tài" : "Xỉu",
+      du_doan: ensemble.pred === "T" ? "Tài" : "Xỉu",
       ty_le_thanh_cong: `${tyLe}%`,
-      giai_thich: why.join(" | "),
-      muc_do_rui_ro: riskLevel(conf, hist),
+      giai_thich,
+      muc_do_rui_ro: riskLevel(ensemble.conf, hist),
       meta: {
-        do_tin_cay: Math.round(conf * 100) + "%",
-        mau_backtest: bt.sample,
+        do_tin_cay: Math.round(ensemble.conf * 100) + "%",
+        ensemble_conf_decimal: Number(ensemble.conf.toFixed(4)),
+        backtest_sample: bt.sample,
+        backtest_acc: Number((bt.acc * 100).toFixed(2)),
+        per_model: ensemble.modelStats,
+        diagnostics: ensemble.diagnostics,
       },
     };
 
     res.json(out);
   } catch (e) {
-    console.error(e);
+    console.error("ERROR", e && e.message ? e.message : e);
     res.status(500).json({ error: "Lỗi server hoặc nguồn" });
   }
 });
 
-// API chi tiết: trả lịch sử đã chuẩn hoá + dự đoán & confidence cho 20 phiên gần nhất
+// walk-forward detailed endpoint
 app.get("/api/du-doan/full", async (req, res) => {
   try {
     const { data } = await axios.get(SOURCE_URL, { timeout: 15000 });
@@ -465,45 +557,42 @@ app.get("/api/du-doan/full", async (req, res) => {
     if (!hist.length) return res.status(502).json({ error: "Không lấy được dữ liệu nguồn" });
 
     const detail = [];
-    // mô phỏng dự đoán "thời điểm đó" (walk-forward)
-    const start = Math.max(5, hist.length - 20);
+    const start = Math.max(8, hist.length - 40);
     for (let i = start; i < hist.length; i++) {
-      const past = hist.slice(0, i); // dùng lịch sử trước phiên i
+      const past = hist.slice(0, i);
       const cur = hist[i];
-      const { pred, conf } = ensemblePredict(past);
+      const ens = ensemblePredictOptimized(past);
       detail.push({
         phien: cur.phien,
         ket_qua_thuc: cur.ket_qua === "T" ? "Tài" : "Xỉu",
-        du_doan_tai_thoi_diem_do: pred === "T" ? "Tài" : "Xỉu",
-        dung_khong: pred === cur.ket_qua,
-        do_tin_cay: Math.round(conf * 100) + "%",
+        du_doan_tai_thoi_diem_do: ens.pred === "T" ? "Tài" : "Xỉu",
+        dung_khong: ens.pred === cur.ket_qua,
+        do_tin_cay: Math.round(ens.conf * 100) + "%",
+        per_model: ens.modelStats,
+        diagnostics: ens.diagnostics,
       });
     }
 
-    const { pred, conf, why } = ensemblePredict(hist);
-    const bt = overallBacktest(hist, 120);
+    const curr = ensemblePredictOptimized(hist);
+    const bt = overallBacktest(hist, 200);
 
     res.json({
       now: hist.at(-1)?.phien,
       next: hist.at(-1)?.phien + 1,
-      du_doan_tiep: pred === "T" ? "Tài" : "Xỉu",
-      do_tin_cay: Math.round(conf * 100) + "%",
-      muc_do_rui_ro: riskLevel(conf, hist),
-      giai_thich: why,
-      backtest: {
-        ty_le_thanh_cong: Math.round(bt.acc * 100) + "%",
-        so_mau: bt.sample,
-      },
-      chi_tiet_20_phien_gan: detail,
+      du_doan_tiep: curr.pred === "T" ? "Tài" : "Xỉu",
+      do_tin_cay: Math.round(curr.conf * 100) + "%",
+      muc_do_rui_ro: riskLevel(curr.conf, hist),
+      giai_thich: curr.why,
+      backtest: { ty_le_thanh_cong: Math.round(bt.acc * 100) + "%", so_mau: bt.sample },
+      chi_tiet_walkforward: detail,
     });
   } catch (e) {
-    console.error(e);
+    console.error("ERR", e && e.message ? e.message : e);
     res.status(500).json({ error: "Lỗi server hoặc nguồn" });
   }
 });
 
 // ---------------------- START ----------------------
-
 app.listen(PORT, () => {
-  console.log(`VIP99+ API đang chạy tại http://localhost:${PORT}`);
+  console.log(`VIP-Ultimate API đang chạy tại http://localhost:${PORT}`);
 });
