@@ -1,10 +1,3 @@
-/**
- * VIP99+ Tai/Xiu API — Node.js (Express)
- * Nguồn dữ liệu: https://fullsrc-daynesun.onrender.com/api/taixiu/history
- * Trả về: phien, xuc_xac, tong, ket_qua, phien_sau, du_doan, ty_le_thanh_cong (backtest),
- *         giai_thich, muc_do_rui_ro
- */
-
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
@@ -16,7 +9,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ---------------------- UTILS ----------------------
+// ---------------------- UTILITIES ----------------------
 
 function normResult(v) {
   if (v == null) return null;
@@ -25,21 +18,19 @@ function normResult(v) {
   if (["x", "xiu", "xỉu", "xỉu"].includes(s)) return "X";
   return null;
 }
-
 function lastN(arr, n) {
   return arr.slice(-n);
 }
 function avg(arr) {
-  if (!arr.length) return 0;
+  if (!arr || !arr.length) return 0;
   return arr.reduce((a, b) => a + b, 0) / arr.length;
 }
-
 function sum(arr) {
+  if (!arr || !arr.length) return 0;
   return arr.reduce((a, b) => a + b, 0);
 }
-
 function streakOfEnd(arr) {
-  if (!arr.length) return 0;
+  if (!arr || !arr.length) return 0;
   const last = arr[arr.length - 1];
   let s = 1;
   for (let i = arr.length - 2; i >= 0; i--) {
@@ -52,9 +43,6 @@ function streakOfEnd(arr) {
 // ---------------------- LAYER 0: LOAD & SHAPE ----------------------
 
 function shapeHistory(raw) {
-  // Kỳ vọng mỗi phần tử có: Phien, Xuc_xac_1, Xuc_xac_2, Xuc_xac_3, Tong, Ket_qua
-  // Trả về mảng lịch sử chuẩn hoá:
-  // { phien, dice:[a,b,c], tong, ket_qua:'T'|'X' }
   if (!Array.isArray(raw)) return [];
   return raw
     .filter(
@@ -75,13 +63,12 @@ function shapeHistory(raw) {
       raw: r,
     }))
     .filter((r) => r.ket_qua === "T" || r.ket_qua === "X")
-    .sort((a, b) => a.phien - b.phien); // đảm bảo tăng dần theo phiên
+    .sort((a, b) => a.phien - b.phien);
 }
 
-// ---------------------- LAYER 1: RULES (Ưu tiên bên mạnh) ----------------------
+// ---------------------- LAYER 1: RULES (Heuristic) ----------------------
 
 function rulesPrediction(hist) {
-  // Hist: array các bản ghi chuẩn hoá
   const results = hist.map((h) => h.ket_qua);
   const totals = hist.map((h) => h.tong);
   const last = results.at(-1);
@@ -93,7 +80,6 @@ function rulesPrediction(hist) {
   let explain = [];
   let score = { T: 0, X: 0 };
 
-  // 1-2. 5 phiên gần nhất lệch
   if (last5.filter((r) => r === "T").length >= 4) {
     return { pred: "T", conf: 0.86, why: ["5 phiên gần nhất nghiêng Tài (≥4/5)"] };
   }
@@ -101,7 +87,6 @@ function rulesPrediction(hist) {
     return { pred: "X", conf: 0.86, why: ["5 phiên gần nhất nghiêng Xỉu (≥4/5)"] };
   }
 
-  // 3. 3 phiên liên tục => đảo cầu
   if (last3.length === 3 && last3.every((r) => r === "T")) {
     return { pred: "X", conf: 0.8, why: ["3 Tài liên tiếp → ưu tiên đảo Xỉu"] };
   }
@@ -109,7 +94,6 @@ function rulesPrediction(hist) {
     return { pred: "T", conf: 0.8, why: ["3 Xỉu liên tiếp → ưu tiên đảo Tài"] };
   }
 
-  // 4. Zigzag T-X-T-X-T
   const zigzag = last5.length === 5 && last5.every((v, i, arr) => i === 0 || v !== arr[i - 1]);
   if (zigzag) {
     return {
@@ -119,7 +103,6 @@ function rulesPrediction(hist) {
     };
   }
 
-  // 5. Trung bình tổng gần
   const avg5 = total5.length ? avg(total5) : 10.5;
   if (avg5 >= 12) {
     score.T += 2;
@@ -129,7 +112,6 @@ function rulesPrediction(hist) {
     explain.push("Trung bình tổng 5 phiên thấp (≤9.5) → Xỉu");
   }
 
-  // 6. Tổng tăng/giảm 3 phiên
   if (total3.length === 3) {
     if (total3[2] > total3[1] && total3[1] > total3[0]) {
       score.T += 2;
@@ -140,7 +122,6 @@ function rulesPrediction(hist) {
     }
   }
 
-  // 7-9. Cực trị và đồng nhất
   const lastTotal = totals.at(-1) ?? 10;
   if (lastTotal >= 17) {
     score.T += 3;
@@ -170,7 +151,6 @@ function rulesPrediction(hist) {
     conf = 0.68 + Math.min(0.12, (score.X - score.T) * 0.04);
     explain.push("Điểm score nghiêng Xỉu");
   } else {
-    // Bias theo avg5
     if (avg5 >= 11) {
       pred = "T";
       conf = 0.64;
@@ -189,16 +169,15 @@ function rulesPrediction(hist) {
   return { pred, conf, why: explain };
 }
 
-// ---------------------- LAYER 2: MÔ HÌNH "HỌC" ĐƠN GIẢN ----------------------
+// ---------------------- LAYER 2: MODEL-BASED ----------------------
 
 function markovPrediction(hist) {
-  // Xây ma trận chuyển T→T, T→X, X→T, X→X từ 60 phiên gần nhất
   const rs = hist.map((h) => h.ket_qua);
   const use = lastN(rs, 60);
   let tt = 1,
     tx = 1,
     xt = 1,
-    xx = 1; // +1 smoothing
+    xx = 1;
 
   for (let i = 1; i < use.length; i++) {
     const prev = use[i - 1];
@@ -226,12 +205,11 @@ function markovPrediction(hist) {
   }
 
   const pred = pT >= pX ? "T" : "X";
-  const conf = Math.max(pT, pX); // 0.5 ~ 1
+  const conf = Math.max(pT, pX);
   return { pred, conf: 0.6 + (conf - 0.5) * 0.8, why };
 }
 
 function recentPatternPrediction(hist) {
-  // Tìm mẫu ngắn 3-4 bước lặp trong 20 phiên (pattern mining đơn giản)
   const rs = hist.map((h) => h.ket_qua);
   const use = lastN(rs, 20);
   let why = [];
@@ -254,14 +232,12 @@ function recentPatternPrediction(hist) {
   const b3 = bestEntry(pat3Counts);
   const b4 = bestEntry(pat4Counts);
 
-  // Chọn pattern xuất hiện nhiều
   let pred = null;
   let conf = 0.58;
 
   if (b4 && b4[1] >= 3) {
-    // lấy 3 ký tự đầu của pattern 4, dự đoán bước tiếp theo theo pattern
     const patt = b4[0];
-    const next = patt[3]; // ký tự thứ 4 của mẫu thường là “tiếp theo” trong cụm
+    const next = patt[3];
     pred = next === "T" ? "T" : "X";
     conf = 0.72 + Math.min(0.12, (b4[1] - 3) * 0.04);
     why.push(`Pattern 4 bước lặp nhiều: ${patt} x${b4[1]}`);
@@ -272,12 +248,11 @@ function recentPatternPrediction(hist) {
     conf = 0.68 + Math.min(0.1, (b3[1] - 4) * 0.03);
     why.push(`Pattern 3 bước lặp nhiều: ${patt} x${b3[1]}`);
   } else {
-    // fallback: dựa vào tỉ lệ gần đây có trọng số
     const weights = use.map((_, i) => Math.pow(1.15, i));
     const tScore = use.reduce((s, v, i) => s + (v === "T" ? weights[i] : 0), 0);
     const xScore = use.reduce((s, v, i) => s + (v === "X" ? weights[i] : 0), 0);
     pred = tScore >= xScore ? "T" : "X";
-    const dom = Math.abs(tScore - xScore) / (tScore + xScore);
+    const dom = Math.abs(tScore - xScore) / (tScore + xScore || 1);
     conf = 0.6 + Math.min(0.2, dom * 0.8);
     why.push("Trọng số gần đây nghiêng " + (pred === "T" ? "Tài" : "Xỉu"));
   }
@@ -286,10 +261,9 @@ function recentPatternPrediction(hist) {
 }
 
 function breakStreakFilter(hist) {
-  // Nếu bệt dài → cân nhắc bẻ cầu theo xác suất
   const rs = hist.map((h) => h.ket_qua);
   const s = streakOfEnd(rs);
-  const cur = rs.at(-1); // kết quả hiện tại
+  const cur = rs.at(-1);
 
   let breakProb = 0;
   if (s >= 8) breakProb = 0.78;
@@ -304,7 +278,6 @@ function breakStreakFilter(hist) {
       why: [`Chuỗi ${s} ${cur === "T" ? "Tài" : "Xỉu"} → xác suất bẻ cầu ${Math.round(breakProb * 100)}%`],
     };
   }
-  // nếu không bẻ, đề xuất giữ tiếp
   return {
     pred: cur,
     conf: 0.55,
@@ -312,94 +285,211 @@ function breakStreakFilter(hist) {
   };
 }
 
-// ---------------------- LAYER 3: ENSEMBLE ----------------------
+// ---------------------- ENSEMBLE: LOGISTIC ONLINE + HEURISTIC ----------------------
 
-function ensemblePredict(hist) {
+// feature extractor for logistic ensemble
+function extractFeaturesForEnsemble(hist) {
+  const N = hist.length;
+  const rs = hist.map(h => h.ket_qua);
+  const totals = hist.map(h => h.tong);
+
+  const last5 = lastN(rs, 5);
+  const last10 = lastN(rs, 10);
+  const last20 = lastN(rs, 20);
+
+  const freqT_5 = last5.filter(r => r === 'T').length / (last5.length || 1);
+  const freqT_10 = last10.filter(r => r === 'T').length / (last10.length || 1);
+  const avg5 = avg(lastN(totals, 5));
+  const avg10 = avg(lastN(totals, 10));
+  const run = Math.min(1, streakOfEnd(rs) / 10);
+
+  const switchRate12 = (() => {
+    const s = lastN(rs, 12);
+    if (s.length <= 1) return 0.5;
+    let sw = 0;
+    for (let i=1;i<s.length;i++) if (s[i] !== s[i-1]) sw++;
+    return sw / (s.length - 1);
+  })();
+
+  const parityRatio5 = lastN(totals,5).filter(t=>t%2===0).length / (last5.length || 1);
+  const markov = markovTransitionFeature(rs);
   const r1 = rulesPrediction(hist);
   const r2 = markovPrediction(hist);
   const r3 = recentPatternPrediction(hist);
   const r4 = breakStreakFilter(hist);
 
-  // Trọng số động theo hiệu suất gần đây (tự đánh giá nhanh trong 30 phiên cuối)
-  const perf = localPerformance(hist, 30, [rulesPrediction, markovPrediction, recentPatternPrediction, breakStreakFilter]);
+  return {
+    f_freqT_5: freqT_5,
+    f_freqT_10: freqT_10,
+    f_avg5: avg5 / 18,
+    f_avg10: avg10 / 18,
+    f_run: run,
+    f_switch12: switchRate12,
+    f_parity5: parityRatio5,
+    m_markov_Tprob: markov.pT || 0.5,
+    model_r1_T: r1.pred === 'T' ? r1.conf : 1 - r1.conf,
+    model_r2_T: r2.pred === 'T' ? r2.conf : 1 - r2.conf,
+    model_r3_T: r3.pred === 'T' ? r3.conf : 1 - r3.conf,
+    model_r4_T: r4.pred === 'T' ? r4.conf : 1 - r4.conf,
+  };
+}
 
-  const weights = [
-    0.28 * perf[0], // rules
-    0.24 * perf[1], // markov
-    0.28 * perf[2], // pattern
-    0.20 * perf[3], // breakStreak
-  ];
+function markovTransitionFeature(rs) {
+  const use = lastN(rs, 120);
+  if (use.length < 2) return { pT: 0.5, pX: 0.5 };
+  let tt=1, tx=1, xt=1, xx=1;
+  for (let i=1;i<use.length;i++){
+    const a=use[i-1], b=use[i];
+    if (a==='T'&&b==='T') tt++;
+    if (a==='T'&&b==='X') tx++;
+    if (a==='X'&&b==='T') xt++;
+    if (a==='X'&&b==='X') xx++;
+  }
+  const last = use.at(-1);
+  if (last==='T'){ const s=tt+tx; return { pT: tt/s, pX: tx/s }; }
+  const s=xt+xx; return { pT: xt/s, pX: xx/s };
+}
+
+// Online logistic classifier
+class OnlineLogisticEnsemble {
+  constructor(featureKeys, lr = 0.02, reg = 1e-3) {
+    this.keys = featureKeys;
+    this.lr = lr;
+    this.reg = reg;
+    this.w = {};
+    featureKeys.forEach(k => this.w[k] = (Math.random() * 0.02) - 0.01);
+    this.bias = 0;
+    this._warmed = false;
+  }
+
+  _dot(features) {
+    let s = this.bias;
+    this.keys.forEach(k => { s += (this.w[k] || 0) * (features[k] || 0);});
+    return s;
+  }
+
+  predictProb(features) {
+    const z = this._dot(features);
+    const p = 1 / (1 + Math.exp(-z));
+    return p;
+  }
+
+  update(features, label) {
+    const p = this.predictProb(features);
+    const err = p - label;
+    this.keys.forEach(k => {
+      const g = err * (features[k] || 0) + this.reg * (this.w[k] || 0);
+      this.w[k] = (this.w[k] || 0) - this.lr * g;
+    });
+    this.bias = this.bias - this.lr * err;
+  }
+
+  batchFitWalkForward(history, featureFn, warm=50) {
+    const N = history.length;
+    if (N < warm + 5) return;
+    for (let i = warm; i < N-1; i++) {
+      const past = history.slice(0, i+1);
+      const features = featureFn(past);
+      const label = history[i+1].ket_qua === 'T' ? 1 : 0;
+      this.update(features, label);
+    }
+    this._warmed = true;
+  }
+}
+
+const ensembleFeatureKeys = [
+  'f_freqT_5','f_freqT_10','f_avg5','f_avg10','f_run','f_switch12','f_parity5',
+  'm_markov_Tprob','model_r1_T','model_r2_T','model_r3_T','model_r4_T'
+];
+const LOGISTIC_ENSEMBLE = new OnlineLogisticEnsemble(ensembleFeatureKeys, 0.02, 1e-3);
+
+// ensemblePredict wrapper
+function ensemblePredict(hist) {
+  if (!hist || hist.length < 5) {
+    // fallback trivial
+    return { pred: hist.at(-1)?.ket_qua || "T", conf: 0.55, why: ["Không đủ dữ liệu, fallback"] };
+  }
+
+  // warm logistic on first pass
+  if (hist.length > 120 && !LOGISTIC_ENSEMBLE._warmed) {
+    LOGISTIC_ENSEMBLE.batchFitWalkForward(hist, extractFeaturesForEnsemble, 60);
+  }
+
+  const features = extractFeaturesForEnsemble(hist);
+  const pT = LOGISTIC_ENSEMBLE.predictProb(features);
+  const pX = 1 - pT;
+  const predLog = pT >= pX ? 'T' : 'X';
+  const confLog = Math.max(pT, pX);
+
+  // heuristic ensemble as second opinion
+  const r1 = rulesPrediction(hist);
+  const r2 = markovPrediction(hist);
+  const r3 = recentPatternPrediction(hist);
+  const r4 = breakStreakFilter(hist);
 
   const votes = [
-    { p: r1.pred, c: r1.conf * weights[0], why: r1.why },
-    { p: r2.pred, c: r2.conf * weights[1], why: r2.why },
-    { p: r3.pred, c: r3.conf * weights[2], why: r3.why },
-    { p: r4.pred, c: r4.conf * weights[3], why: r4.why },
+    { p: r1.pred, c: r1.conf * 0.25, why: r1.why },
+    { p: r2.pred, c: r2.conf * 0.2, why: r2.why },
+    { p: r3.pred, c: r3.conf * 0.3, why: r3.why },
+    { p: r4.pred, c: r4.conf * 0.15, why: r4.why },
+    { p: predLog, c: confLog * 0.4, why: [`Logistic ensemble pT=${pT.toFixed(3)}`] }
   ];
 
-  const scoreT = sum(votes.map((v) => (v.p === "T" ? v.c : 0)));
-  const scoreX = sum(votes.map((v) => (v.p === "X" ? v.c : 0)));
-  const pred = scoreT >= scoreX ? "T" : "X";
-
+  const scoreT = sum(votes.map(v => v.p === 'T' ? v.c : 0));
+  const scoreX = sum(votes.map(v => v.p === 'X' ? v.c : 0));
+  const pred = scoreT >= scoreX ? 'T' : 'X';
   const rawConf = Math.max(scoreT, scoreX) / (scoreT + scoreX || 1);
-  // Điều chỉnh nhẹ theo độ đồng thuận
-  const agree = votes.filter((v) => v.p === pred).length / votes.length; // 0..1
+  const agree = votes.filter(v => v.p === pred).length / votes.length;
   const conf = Math.min(0.99, 0.65 + (rawConf - 0.5) * 0.7 + agree * 0.12);
 
-  const why = votes
-    .filter((v) => v.p === pred)
-    .flatMap((v) => v.why)
-    .concat([`Đồng thuận ${Math.round(agree * 100)}% giữa các lớp`]);
+  const why = votes.filter(v => v.p === pred).flatMap(v => v.why).concat([`Đồng thuận ${Math.round(agree*100)}%`]);
 
-  return { pred, conf, why };
+  return { pred, conf, why, pieces: { logistic: { pT, pX }, votes } };
 }
 
-function localPerformance(hist, lookback, models) {
-  // Backtest nhanh cho từng model trong lookback phiên:
-  // dự đoán phiên i dựa vào lịch sử < i
+// ---------------------- BACKTEST + KELLY ----------------------
+
+function overallBacktest(hist, lookback = 100, betUnit = 1) {
   const n = Math.min(lookback, hist.length - 1);
-  if (n <= 5) return models.map(() => 1.0); // không đủ dữ liệu, neutral
-
-  const start = hist.length - 1 - n; // index bắt đầu
-  const correct = new Array(models.length).fill(0);
-  const count = n;
-
-  for (let i = start; i < hist.length - 1; i++) {
-    const past = hist.slice(0, i + 1); // lịch sử đến i
-    const actualNext = hist[i + 1].ket_qua;
-    models.forEach((fn, idx) => {
-      const { pred } = fn(past);
-      if (pred === actualNext) correct[idx]++;
-    });
-  }
-
-  // chuyển thành hệ số 0.8 ~ 1.2 để nhân trọng số
-  return correct.map((c) => {
-    const acc = c / count; // 0..1
-    return 0.8 + Math.min(0.4, Math.max(0, (acc - 0.5) * 0.8)); // 0.8..1.2
-  });
-}
-
-// ---------------------- BACKTEST CHUNG (tỷ lệ thành công) ----------------------
-
-function overallBacktest(hist, lookback = 80) {
-  const n = Math.min(lookback, hist.length - 1);
-  if (n <= 10) return { acc: 0.62, sample: n }; // không đủ dữ liệu
+  if (n <= 10) return { acc: 0, sample: n, bankroll: null, details: [] };
 
   let correct = 0;
+  let bankroll = 1000;
+  const details = [];
   for (let i = hist.length - 1 - n; i < hist.length - 1; i++) {
-    const past = hist.slice(0, i + 1);
-    const actualNext = hist[i + 1].ket_qua;
-    const { pred } = ensemblePredict(past);
-    if (pred === actualNext) correct++;
+    const past = hist.slice(0, i+1);
+    const res = ensemblePredict(past);
+    const actualNext = hist[i+1].ket_qua;
+    const betSize = kellyBetSize(res.conf, 0.95, bankroll, betUnit); // suggested bet
+    // simplified payout: 1:1 on win
+    if (res.pred === actualNext) {
+      correct++;
+      bankroll += betSize;
+    } else {
+      bankroll -= betSize;
+    }
+    details.push({ idx: i+1, pred: res.pred, actual: actualNext, conf: res.conf, bet: betSize, bankroll: bankroll });
   }
-  return { acc: correct / n, sample: n };
+  const acc = correct / n;
+  return { acc, sample: n, bankroll, details: details.slice(-200) };
+}
+
+function kellyBetSize(confidence, payout = 0.95, bankroll = 1000, baseUnit = 1) {
+  // confidence: prob of win (0..1). payout: net odds (e.g., 0.95 for near even)
+  // Kelly fraction = (bp - q)/b where b = payout, p=confidence, q=1-p
+  const p = Math.max(0.01, Math.min(0.99, confidence));
+  const b = payout;
+  const q = 1 - p;
+  const k = (b * p - q) / b;
+  if (k <= 0) return baseUnit; // no edge -> minimal unit
+  // cap fraction to avoid overbetting
+  const frac = Math.min(0.2, k); // max 20% bankroll on single bet
+  return Math.max(1, Math.round(bankroll * frac)); // at least 1 unit
 }
 
 // ---------------------- RISK LEVEL ----------------------
 
 function riskLevel(conf, hist) {
-  // Điều chỉnh theo biến động gần đây (switch rate) và chuỗi bệt
   const rs = hist.map((h) => h.ket_qua);
   const last12 = lastN(rs, 12);
   let switches = 0;
@@ -409,9 +499,9 @@ function riskLevel(conf, hist) {
   const switchRate = last12.length > 1 ? switches / (last12.length - 1) : 0.5;
   const s = streakOfEnd(rs);
 
-  let risk = 1 - conf; // conf cao → rủi ro thấp
+  let risk = 1 - conf;
   risk += switchRate * 0.15;
-  if (s >= 6) risk += 0.05; // bệt dài có thể bẻ ngược khó lường
+  if (s >= 6) risk += 0.05;
 
   if (risk <= 0.22) return "Thấp";
   if (risk <= 0.35) return "Trung bình";
@@ -422,7 +512,6 @@ function riskLevel(conf, hist) {
 
 app.get("/health", (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
-// API đơn: dự đoán phiên kế tiếp dựa trên phiên mới nhất
 app.get("/api/du-doan", async (req, res) => {
   try {
     const { data } = await axios.get(SOURCE_URL, { timeout: 15000 });
@@ -430,9 +519,10 @@ app.get("/api/du-doan", async (req, res) => {
     if (!hist.length) return res.status(502).json({ error: "Không lấy được dữ liệu nguồn" });
 
     const last = hist.at(-1);
-    const { pred, conf, why } = ensemblePredict(hist);
-    const bt = overallBacktest(hist, 100); // backtest 100 phiên gần nhất nếu có
-    const tyLe = Math.round(bt.acc * 100); // không random, theo backtest
+    const { pred, conf, why, pieces } = ensemblePredict(hist);
+    const bt = overallBacktest(hist, 120);
+    const tyLe = Math.round(bt.acc * 100);
+    const kelly = kellyBetSize(conf, 0.95, 1000, 1);
 
     const out = {
       phien: last.phien,
@@ -441,13 +531,15 @@ app.get("/api/du-doan", async (req, res) => {
       ket_qua: last.ket_qua === "T" ? "Tài" : "Xỉu",
       phien_sau: last.phien + 1,
       du_doan: pred === "T" ? "Tài" : "Xỉu",
-      ty_le_thanh_cong: `${tyLe}%`,
+      ty_le_thanh_cong: `${tyLe}% (backtest ${bt.sample} mẫu)`,
+      do_tin_cay: `${Math.round(conf * 100)}%`,
+      goi_y_cuoc_kelly: kelly,
       giai_thich: why.join(" | "),
       muc_do_rui_ro: riskLevel(conf, hist),
       meta: {
-        do_tin_cay: Math.round(conf * 100) + "%",
-        mau_backtest: bt.sample,
-      },
+        logistic_pieces: pieces ? pieces.logistic : null,
+        votes: pieces ? pieces.votes : null
+      }
     };
 
     res.json(out);
@@ -457,7 +549,6 @@ app.get("/api/du-doan", async (req, res) => {
   }
 });
 
-// API chi tiết: trả lịch sử đã chuẩn hoá + dự đoán & confidence cho 20 phiên gần nhất
 app.get("/api/du-doan/full", async (req, res) => {
   try {
     const { data } = await axios.get(SOURCE_URL, { timeout: 15000 });
@@ -465,36 +556,57 @@ app.get("/api/du-doan/full", async (req, res) => {
     if (!hist.length) return res.status(502).json({ error: "Không lấy được dữ liệu nguồn" });
 
     const detail = [];
-    // mô phỏng dự đoán "thời điểm đó" (walk-forward)
     const start = Math.max(5, hist.length - 20);
     for (let i = start; i < hist.length; i++) {
-      const past = hist.slice(0, i); // dùng lịch sử trước phiên i
+      const past = hist.slice(0, i);
       const cur = hist[i];
-      const { pred, conf } = ensemblePredict(past);
+      const predRes = ensemblePredict(past);
       detail.push({
         phien: cur.phien,
         ket_qua_thuc: cur.ket_qua === "T" ? "Tài" : "Xỉu",
-        du_doan_tai_thoi_diem_do: pred === "T" ? "Tài" : "Xỉu",
-        dung_khong: pred === cur.ket_qua,
-        do_tin_cay: Math.round(conf * 100) + "%",
+        du_doan_tai_thoi_diem_do: predRes.pred === "T" ? "Tài" : "Xỉu",
+        dung_khong: predRes.pred === cur.ket_qua,
+        do_tin_cay: Math.round(predRes.conf * 100) + "%",
       });
     }
 
-    const { pred, conf, why } = ensemblePredict(hist);
-    const bt = overallBacktest(hist, 120);
+    const final = ensemblePredict(hist);
+    const bt = overallBacktest(hist, 200);
 
     res.json({
       now: hist.at(-1)?.phien,
       next: hist.at(-1)?.phien + 1,
-      du_doan_tiep: pred === "T" ? "Tài" : "Xỉu",
-      do_tin_cay: Math.round(conf * 100) + "%",
-      muc_do_rui_ro: riskLevel(conf, hist),
-      giai_thich: why,
+      du_doan_tiep: final.pred === "T" ? "Tài" : "Xỉu",
+      do_tin_cay: Math.round(final.conf * 100) + "%",
+      muc_do_rui_ro: riskLevel(final.conf, hist),
+      giai_thich: final.why,
       backtest: {
         ty_le_thanh_cong: Math.round(bt.acc * 100) + "%",
         so_mau: bt.sample,
+        final_bankroll: bt.bankroll
       },
       chi_tiet_20_phien_gan: detail,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Lỗi server hoặc nguồn" });
+  }
+});
+
+app.get("/api/backtest", async (req, res) => {
+  // optional query: ?lookback=200
+  try {
+    const { data } = await axios.get(SOURCE_URL, { timeout: 15000 });
+    const hist = shapeHistory(data);
+    if (!hist.length) return res.status(502).json({ error: "Không lấy được dữ liệu nguồn" });
+    const lookback = Math.min(Number(req.query.lookback) || 200, hist.length - 1);
+    const bt = overallBacktest(hist, lookback);
+    res.json({
+      lookback,
+      acc: Math.round(bt.acc * 10000) / 100,
+      sample: bt.sample,
+      final_bankroll: bt.bankroll,
+      recent_details: bt.details.slice(-50)
     });
   } catch (e) {
     console.error(e);
@@ -505,5 +617,5 @@ app.get("/api/du-doan/full", async (req, res) => {
 // ---------------------- START ----------------------
 
 app.listen(PORT, () => {
-  console.log(`VIP99+ API đang chạy tại http://localhost:${PORT}`);
+  console.log(`VIP-ish Predictor running at http://localhost:${PORT}`);
 });
