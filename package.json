@@ -1,26 +1,13 @@
 {
   "name": "vip-taixiu-api",
   "version": "1.0.0",
-  "description": "VIP API dự đoán Tài/Xỉu",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "keywords": [
-    "taixiu",
-    "predict",
-    "api",
-    "vip"
-  ],
-  "author": "MinhDuc",
-  "license": "MIT",
   "dependencies": {
-    "axios": "^1.6.8",
     "express": "^4.18.2",
-    "ml-cart": "^3.1.0",
-    "cors": "^2.8.5"
-  },
-  "engines": {
-    "node": ">=18.x"
+    "axios": "^1.6.8",
+    "ml-cart": "^3.0.1" 
   }
 }
