@@ -1,11 +1,6 @@
 /**
- * VIP-Ultimate — nâng cấp so với VIP99+
- * - Thêm models: pattern (triple/pair/straight), parity, bucket (tổng range)
- * - Tính entropy, transition matrix, run-length
- * - Tối ưu trọng số bằng hill-climb dựa trên backtest walk-forward
- * - Trả về giai_thich chi tiết: per-model stats, pattern stats, entropy, transitions, streak
- *
- * Lưu ý: Càng nhiều lịch sử (samples) càng đáng tin. Không thể đảm bảo 100% thắng.
+ * VIP-Ultimate — bản nâng cấp (sửa lỗi + cache + optimizer cải tiến)
+ * Lưu ý: KHÔNG CÓ GIẢI PHÁP 100% thắng. Chỉ tối ưu, cung cấp diagnostics.
  */
 
 const express = require("express");
@@ -13,18 +8,47 @@ const axios = require("axios");
 const cors = require("cors");
 
 const PORT = process.env.PORT || 3000;
-const SOURCE_URL = "https://fullsrc-daynesun.onrender.com/api/taixiu/history";
+const SOURCE_URL = process.env.SOURCE_URL || "https://fullsrc-daynesun.onrender.com/api/taixiu/history";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ---------------------- SIMPLE CACHE & REFRESH ----------------------
+// giữ dữ liệu gần nhất trong bộ nhớ để "treo render" (trả lời nhanh, ít request ra nguồn)
+let CACHE = {
+  data: null,
+  ts: 0,
+  error: null,
+};
+const CACHE_TTL_MS = 10 * 1000; // refresh every 10s
+const FETCH_TIMEOUT = 12_000;
+
+async function refreshCacheIfNeeded() {
+  const now = Date.now();
+  if (CACHE.data && now - CACHE.ts < CACHE_TTL_MS) return;
+  try {
+    const resp = await axios.get(SOURCE_URL, { timeout: FETCH_TIMEOUT });
+    CACHE.data = resp.data;
+    CACHE.ts = now;
+    CACHE.error = null;
+  } catch (err) {
+    CACHE.error = err && err.message ? err.message : String(err);
+    // don't wipe old data on transient error
+    console.warn("[CACHE] fetch error:", CACHE.error);
+  }
+}
+// initial
+refreshCacheIfNeeded();
+// also background refresh periodically (best-effort)
+setInterval(() => { refreshCacheIfNeeded().catch(()=>{}); }, CACHE_TTL_MS);
+
 // ---------------------- UTILS ----------------------
 function normResult(v) {
   if (v == null) return null;
   const s = String(v).trim().toLowerCase();
-  if (["t", "tai", "tài"].includes(s)) return "T";
-  if (["x", "xiu", "xỉu", "xỉu"].includes(s)) return "X";
+  if (["t", "tai", "tài", "tài"].includes(s)) return "T";
+  if (["x", "xiu", "xỉu", "xiu"].includes(s)) return "X";
   return null;
 }
 function lastN(arr, n) {
@@ -108,16 +132,17 @@ function sumBucket(entry) {
 
 // ---------------------- GENERIC CONDITIONAL MODEL ----------------------
 function conditionalModel(hist, extractor, name, minCount = 6) {
-  // build table: key -> counts next T/X
   const table = {};
   for (let i = 0; i < hist.length - 1; i++) {
     const key = extractor(hist[i]);
     const next = hist[i + 1].ket_qua;
     if (!table[key]) table[key] = { T: 0, X: 0, total: 0 };
-    table[key][next] += 1;
+    if (next === "T") table[key].T++;
+    else if (next === "X") table[key].X++;
     table[key].total += 1;
   }
-  const lastKey = extractor(hist[hist.length - 1]);
+  const lastEntry = hist[hist.length - 1];
+  const lastKey = extractor(lastEntry);
   const data = table[lastKey] || null;
   if (!data || data.total < minCount) {
     return {
@@ -129,8 +154,7 @@ function conditionalModel(hist, extractor, name, minCount = 6) {
   }
   const pT = data.T / data.total;
   const pred = pT >= 0.5 ? "T" : "X";
-  // conf mapping: if pT=0.5 -> 0.55, if pT=0.9 -> 0.9
-  const conf = 0.55 + Math.min(0.35, Math.abs(pT - 0.5) * 1.2);
+  const conf = 0.55 + Math.min(0.40, Math.abs(pT - 0.5) * 1.5);
   return {
     pred,
     conf,
@@ -139,7 +163,7 @@ function conditionalModel(hist, extractor, name, minCount = 6) {
   };
 }
 
-// ---------------------- EXISTING MODELS (refined) ----------------------
+// ---------------------- MODELS ----------------------
 function rulesPrediction(hist) {
   const results = hist.map((h) => h.ket_qua);
   const totals = hist.map((h) => h.tong);
@@ -206,7 +230,6 @@ function rulesPrediction(hist) {
   return { pred, conf, why: explain.length ? explain : ["Rules fallback"], meta: { avg5, lastTotal }};
 }
 
-// Markov (giữ như trước)
 function markovPrediction(hist) {
   const rs = hist.map((h) => h.ket_qua);
   const use = lastN(rs, 80);
@@ -225,12 +248,11 @@ function markovPrediction(hist) {
   return { pred, conf, why, meta: { tt, tx, xt, xx }};
 }
 
-// recent pattern (improved)
 function recentPatternPrediction(hist) {
   const rs = hist.map((h) => h.ket_qua);
-  const use = lastN(rs, 30);
+  const use = lastN(rs, 40);
   const patCounts = {};
-  for (let L = 3; L <= 5; L++) {
+  for (let L = 3; L <= 6; L++) {
     for (let i = 0; i <= use.length - L; i++) {
       const k = use.slice(i, i + L).join("");
       patCounts[k] = (patCounts[k] || 0) + 1;
@@ -239,39 +261,38 @@ function recentPatternPrediction(hist) {
   const entries = Object.entries(patCounts).sort((a, b) => b[1] - a[1]);
   if (!entries.length) return { pred: null, conf: 0.5, why: ["Không pattern mạnh"] };
   const [bestPat, cnt] = entries[0];
-  // bestPat dạng "TXT..." -> dự đoán next char = last char of pattern? heuristic: if pattern appears with continuation often -> choose continuation
-  // We will check occurrences where the pattern was followed by a next result
+
   const follow = { T: 0, X: 0, total: 0 };
   for (let i = 0; i <= rs.length - bestPat.length - 1; i++) {
     if (rs.slice(i, i + bestPat.length).join("") === bestPat) {
       const next = rs[i + bestPat.length];
-      follow[next]++; follow.total++;
+      if (next === "T") follow.T++;
+      else if (next === "X") follow.X++;
+      follow.total++;
     }
   }
   if (follow.total < 4) {
-    // fallback to weighted recent
     const weights = use.map((_, i) => Math.pow(1.12, i));
     const tScore = use.reduce((s, v, i) => s + (v === "T" ? weights[i] : 0), 0);
     const xScore = use.reduce((s, v, i) => s + (v === "X" ? weights[i] : 0), 0);
     const pred = tScore >= xScore ? "T" : "X";
-    const dom = Math.abs(tScore - xScore) / (tScore + xScore);
+    const dom = Math.abs(tScore - xScore) / (tScore + xScore || 1);
     const conf = 0.6 + Math.min(0.28, dom * 0.9);
     return { pred, conf, why: ["No strong follow; fallback weighted recent"], meta: { bestPat, cnt } };
   }
   const pT = follow.T / follow.total;
   const pred = pT >= 0.5 ? "T" : "X";
-  const conf = 0.6 + Math.min(0.36, Math.abs(pT - 0.5) * 1.3);
+  const conf = 0.6 + Math.min(0.38, Math.abs(pT - 0.5) * 1.4);
   return { pred, conf, why: [`Pattern ${bestPat} x${cnt}, follow: P(T)=${pT.toFixed(3)} (${follow.total} samples)`], meta: { bestPat, cnt, follow } };
 }
 
-// breakStreakFilter (refined)
 function breakStreakFilter(hist) {
   const rs = hist.map((h) => h.ket_qua);
   const s = streakOfEnd(rs);
   const cur = rs.at(-1);
   let breakProb = 0;
-  if (s >= 10) breakProb = 0.82;
-  else if (s >= 8) breakProb = 0.76;
+  if (s >= 12) breakProb = 0.86;
+  else if (s >= 9) breakProb = 0.78;
   else if (s >= 6) breakProb = 0.68;
   else if (s >= 4) breakProb = 0.62;
   if (breakProb >= 0.62) {
@@ -281,18 +302,11 @@ function breakStreakFilter(hist) {
   return { pred: cur, conf: 0.56, why: [`Chuỗi ${s} → theo cầu`], meta: { streak: s } };
 }
 
-// ---------------------- NEW MODELS (pattern/parity/bucket) ----------------------
-function patternConditionalModel(hist) {
-  return conditionalModel(hist, getPatternType, "DicePattern", 5);
-}
-function parityConditionalModel(hist) {
-  return conditionalModel(hist, parityBucket, "ParityPrevSum", 8);
-}
-function bucketConditionalModel(hist) {
-  return conditionalModel(hist, sumBucket, "SumBucket", 8);
-}
+// conditional wrappers
+function patternConditionalModel(hist) { return conditionalModel(hist, getPatternType, "DicePattern", 5); }
+function parityConditionalModel(hist) { return conditionalModel(hist, parityBucket, "ParityPrevSum", 8); }
+function bucketConditionalModel(hist) { return conditionalModel(hist, sumBucket, "SumBucket", 8); }
 
-// ---------------------- MODEL LIST ----------------------
 const modelFns = [
   { name: "Rules", fn: rulesPrediction },
   { name: "Markov", fn: markovPrediction },
@@ -314,8 +328,12 @@ function localPerformance(hist, lookback, models) {
     const past = hist.slice(0, i + 1);
     const actualNext = hist[i + 1].ket_qua;
     models.forEach((m, idx) => {
-      const { pred } = m.fn(past);
-      if (pred === actualNext) correct[idx]++;
+      try {
+        const out = m.fn(past);
+        if (out && out.pred === actualNext) correct[idx]++;
+      } catch (e) {
+        // ignore model error
+      }
     });
   }
   return correct.map((c) => {
@@ -333,14 +351,18 @@ function evaluateWeights(hist, models, weights, lookback) {
   for (let i = start; i < hist.length - 1; i++) {
     const past = hist.slice(0, i + 1);
     const actualNext = hist[i + 1].ket_qua;
-    // collect votes
     let scoreT = 0, scoreX = 0;
     for (let k = 0; k < models.length; k++) {
-      const { pred, conf } = models[k].fn(past);
-      const w = weights[k];
-      if (!pred) continue;
-      if (pred === "T") scoreT += conf * w;
-      else scoreX += conf * w;
+      try {
+        const out = models[k].fn(past) || {};
+        const pred = out.pred, conf = out.conf || 0.5;
+        const w = weights[k] || 1.0;
+        if (!pred) continue;
+        if (pred === "T") scoreT += conf * w;
+        else if (pred === "X") scoreX += conf * w;
+      } catch (e) {
+        // ignore single-step error
+      }
     }
     const final = scoreT >= scoreX ? "T" : "X";
     if (final === actualNext) correct++;
@@ -348,45 +370,68 @@ function evaluateWeights(hist, models, weights, lookback) {
   return correct / n;
 }
 
-// simple hill-climb optimizer
-function optimizeWeights(hist, models, lookback = 80, iter = 300) {
-  const base = models.map(() => 1.0);
-  let weights = base.slice();
-  let best = { weights: weights.slice(), acc: evaluateWeights(hist, models, weights, lookback) };
+// ---------------------- OPTIMIZER (hill-climb + annealing) ----------------------
+function optimizeWeights(hist, models, lookback = 80, iter = 600) {
+  const mlen = models.length;
+  let weights = new Array(mlen).fill(1.0);
+  let bestWeights = weights.slice();
+  let bestAcc = evaluateWeights(hist, models, weights, lookback);
+
+  // temperature schedule for mild simulated annealing
+  let T0 = 0.08;
   for (let it = 0; it < iter; it++) {
-    const j = Math.floor(Math.random() * weights.length);
+    // perturb one index
+    const j = Math.floor(Math.random() * mlen);
     const old = weights[j];
-    const factor = 1 + (Math.random() - 0.5) * 0.6; // +-30%
-    weights[j] = Math.max(0.2, Math.min(3.0, weights[j] * factor));
+    // propose multiplicative change
+    const factor = 1 + (Math.random() - 0.5) * 0.8; // +-40%
+    weights[j] = Math.max(0.2, Math.min(3.5, weights[j] * factor));
     const acc = evaluateWeights(hist, models, weights, lookback);
-    if (acc >= best.acc) {
-      best = { weights: weights.slice(), acc };
-      // keep
+    const accept = (() => {
+      if (acc >= bestAcc) return true;
+      // allow occasional uphill moves (annealing)
+      const prob = Math.exp((acc - bestAcc) / (T0 * (1 + it / iter)));
+      return Math.random() < prob;
+    })();
+    if (accept) {
+      if (acc >= bestAcc) {
+        bestAcc = acc;
+        bestWeights = weights.slice();
+      }
+      // keep weights (accepted)
     } else {
+      // revert
       weights[j] = old;
     }
   }
-  return best;
+  return { weights: bestWeights, acc: bestAcc };
 }
 
-// ---------------------- ENSEMBLE (with optimization) ----------------------
+// ---------------------- ENSEMBLE ----------------------
 function ensemblePredictOptimized(hist) {
   // compute per-model outputs now
   const modelOutputs = modelFns.map((m) => {
-    const out = m.fn(hist);
-    return { name: m.name, pred: out.pred, conf: out.conf || 0.5, why: out.why || [], meta: out.meta || {} };
+    try {
+      const out = m.fn(hist) || {};
+      return { name: m.name, pred: out.pred, conf: out.conf || 0.5, why: out.why || [], meta: out.meta || {} };
+    } catch (e) {
+      return { name: m.name, pred: null, conf: 0.5, why: ["error"], meta: {} };
+    }
   });
 
   // baseline perf multipliers
   const perf = localPerformance(hist, 60, modelFns);
-  // initial weights = baseline perf * predefined importance
-  const baseImportance = [1.2, 1.0, 1.1, 0.9, 1.0, 0.9, 0.9]; // tune
-  let initWeights = modelFns.map((_, i) => baseImportance[i] * perf[i]);
+  const baseImportance = [1.2, 1.0, 1.1, 0.95, 1.0, 0.95, 0.95];
+  let initWeights = modelFns.map((_, i) => (baseImportance[i] || 1.0) * (perf[i] || 1.0));
 
-  // optimize multipliers on recent backtest (walk-forward last 120)
-  const opt = optimizeWeights(hist, modelFns, Math.min(120, hist.length - 1), 300);
-  // multiply
-  const finalWeights = initWeights.map((w, i) => w * opt.weights[i]);
+  // optimize multipliers on recent backtest (walk-forward last 120 or less)
+  const look = Math.min(120, Math.max(30, hist.length - 1));
+  const opt = optimizeWeights(hist, modelFns, look, 700);
+  // final weights = init * opt
+  const finalWeights = initWeights.map((w, i) => {
+    const ow = opt.weights && opt.weights[i] ? opt.weights[i] : 1.0;
+    return Math.max(0.05, Math.min(6.0, w * ow));
+  });
 
   // compute votes
   let scoreT = 0, scoreX = 0;
@@ -400,7 +445,7 @@ function ensemblePredictOptimized(hist) {
     modelStats.push({
       name: mo.name,
       pred: mo.pred,
-      conf: Math.round((mo.conf || 0.5) * 100) + "%",
+      conf: `${Math.round((mo.conf || 0.5) * 100)}%`,
       weight: Number(w.toFixed(3)),
       voteScore: Number(vote.toFixed(3)),
       why: mo.why,
@@ -409,21 +454,14 @@ function ensemblePredictOptimized(hist) {
   }
 
   const pred = scoreT >= scoreX ? "T" : "X";
-  const rawConf = Math.max(scoreT, scoreX) / (scoreT + scoreX || 1);
-  // calibrate conf by backtest opt.acc (how well weights performed)
-  const calibratedConf = Math.min(0.995, 0.6 + (rawConf - 0.5) * 0.75 + opt.acc * 0.35);
-  // assemble detailed explanation
+  const rawConf = (scoreT + scoreX) ? Math.max(scoreT, scoreX) / (scoreT + scoreX) : 0.5;
+  const calibratedConf = Math.min(0.995, 0.6 + (rawConf - 0.5) * 0.75 + (opt.acc || 0.5) * 0.35);
   const agree = modelStats.filter((m) => m.pred === pred).length / modelStats.length;
-  const why = [
-    `Final vote: T=${scoreT.toFixed(3)}, X=${scoreX.toFixed(3)} (agree ${Math.round(agree * 100)}%)`,
-    `Optimized weights backtest acc=${(opt.acc * 100).toFixed(1)}% over recent window`,
-  ];
 
-  // additional diagnostics
+  // diagnostics
   const rs = hist.map((h) => h.ket_qua);
   const ent = shannonEntropy(lastN(rs, 30));
   const streak = streakOfEnd(rs);
-  // transition matrix
   const transitions = { "T->T": 0, "T->X": 0, "X->T": 0, "X->X": 0, total: 0 };
   for (let i = 1; i < rs.length; i++) {
     transitions[`${rs[i - 1]}->${rs[i]}`] += 1;
@@ -434,7 +472,6 @@ function ensemblePredictOptimized(hist) {
     transProb[k] = transitions.total ? (transitions[k] / transitions.total).toFixed(3) : "0.000";
   });
 
-  // gather pattern stats (top patterns)
   const patterns = {};
   for (let i = 0; i < hist.length; i++) {
     const p = getPatternType(hist[i]);
@@ -446,14 +483,17 @@ function ensemblePredictOptimized(hist) {
     pred,
     conf: calibratedConf,
     modelStats,
-    why,
+    why: [
+      `Final vote: T=${scoreT.toFixed(3)}, X=${scoreX.toFixed(3)} (agree ${Math.round(agree * 100)}%)`,
+      `Optimized weights backtest acc=${((opt.acc || 0) * 100).toFixed(1)}% over recent window`,
+    ],
     diagnostics: {
       entropy_last30: Number(ent.toFixed(3)),
       streak,
       transitions: transProb,
       top_patterns: patternList.slice(0, 6),
       optimized_weights: opt.weights.map((w) => Number(w.toFixed(3))),
-      optimized_acc: Number((opt.acc * 100).toFixed(2)),
+      optimized_acc: Number(((opt.acc || 0) * 100).toFixed(2)),
     },
   };
 }
@@ -473,7 +513,7 @@ function overallBacktest(hist, lookback = 120) {
   return { acc: correct / n, sample: n };
 }
 
-// ---------------------- RISK LEVEL (updated) ----------------------
+// ---------------------- RISK LEVEL ----------------------
 function riskLevel(conf, hist) {
   const rs = hist.map((h) => h.ket_qua);
   const last12 = lastN(rs, 12);
@@ -485,7 +525,6 @@ function riskLevel(conf, hist) {
   risk += switchRate * 0.12;
   if (s >= 6) risk += 0.06;
   const ent = shannonEntropy(lastN(rs, 30));
-  // entropy high -> unpredictable -> increase risk
   risk += Math.min(0.12, ent / 4);
   if (risk <= 0.20) return "Thấp";
   if (risk <= 0.35) return "Trung bình";
@@ -493,20 +532,25 @@ function riskLevel(conf, hist) {
 }
 
 // ---------------------- API ROUTES ----------------------
-app.get("/health", (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.get("/health", (_, res) => res.json({ ok: true, time: new Date().toISOString(), src: SOURCE_URL }));
 
+// main endpoint (uses cache when possible)
 app.get("/api/du-doan", async (req, res) => {
   try {
-    const { data } = await axios.get(SOURCE_URL, { timeout: 15000 });
-    const hist = shapeHistory(data);
-    if (!hist.length) return res.status(502).json({ error: "Không lấy được dữ liệu nguồn" });
+    // ensure cache is fresh (best-effort)
+    await refreshCacheIfNeeded();
+    if (!CACHE.data) {
+      return res.status(502).json({ error: "Không lấy được dữ liệu nguồn", detail: CACHE.error || "no data" });
+    }
+
+    const hist = shapeHistory(CACHE.data);
+    if (!hist.length) return res.status(502).json({ error: "Dữ liệu lịch sử không hợp lệ" });
 
     const last = hist.at(-1);
     const ensemble = ensemblePredictOptimized(hist);
     const bt = overallBacktest(hist, 160);
     const tyLe = Math.round(bt.acc * 100);
 
-    // build giai_thich chi tiết
     const modelLines = ensemble.modelStats.map((m) => {
       return `${m.name}: pred=${m.pred === "T" ? "Tài" : m.pred === "X" ? "Xỉu" : "?"}, conf=${m.conf}, weight=${m.weight}, note=${(m.why || []).join("; ")}`;
     });
@@ -544,17 +588,19 @@ app.get("/api/du-doan", async (req, res) => {
 
     res.json(out);
   } catch (e) {
-    console.error("ERROR", e && e.message ? e.message : e);
-    res.status(500).json({ error: "Lỗi server hoặc nguồn" });
+    console.error("ERROR /api/du-doan", e && e.message ? e.message : e);
+    res.status(500).json({ error: "Lỗi server hoặc nguồn", detail: e && e.message ? e.message : String(e) });
   }
 });
 
-// walk-forward detailed endpoint
+// detailed walk-forward
 app.get("/api/du-doan/full", async (req, res) => {
   try {
-    const { data } = await axios.get(SOURCE_URL, { timeout: 15000 });
-    const hist = shapeHistory(data);
-    if (!hist.length) return res.status(502).json({ error: "Không lấy được dữ liệu nguồn" });
+    await refreshCacheIfNeeded();
+    if (!CACHE.data) return res.status(502).json({ error: "Không lấy được dữ liệu nguồn", detail: CACHE.error || "no data" });
+
+    const hist = shapeHistory(CACHE.data);
+    if (!hist.length) return res.status(502).json({ error: "Dữ liệu lịch sử không hợp lệ" });
 
     const detail = [];
     const start = Math.max(8, hist.length - 40);
@@ -587,12 +633,12 @@ app.get("/api/du-doan/full", async (req, res) => {
       chi_tiet_walkforward: detail,
     });
   } catch (e) {
-    console.error("ERR", e && e.message ? e.message : e);
-    res.status(500).json({ error: "Lỗi server hoặc nguồn" });
+    console.error("ERR /api/du-doan/full", e && e.message ? e.message : e);
+    res.status(500).json({ error: "Lỗi server hoặc nguồn", detail: e && e.message ? e.message : String(e) });
   }
 });
 
 // ---------------------- START ----------------------
 app.listen(PORT, () => {
-  console.log(`VIP-Ultimate API đang chạy tại http://localhost:${PORT}`);
+  console.log(`VIP-Ultimate API đang chạy tại http://0.0.0.0:${PORT}  (SOURCE_URL=${SOURCE_URL})`);
 });
