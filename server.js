@@ -7,6 +7,7 @@ const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
 
+// Sử dụng biến môi trường của Render
 const PORT = process.env.PORT || 3000;
 const SOURCE_URL = process.env.SOURCE_URL || "https://fullsrc-daynesun.onrender.com/api/taixiu/history";
 
@@ -22,7 +23,7 @@ let CACHE = {
   error: null,
 };
 const CACHE_TTL_MS = 10 * 1000; // refresh every 10s
-const FETCH_TIMEOUT = 12_000;
+const FETCH_TIMEOUT = 12_000; // 12s
 
 async function refreshCacheIfNeeded() {
   const now = Date.now();
@@ -32,23 +33,28 @@ async function refreshCacheIfNeeded() {
     CACHE.data = resp.data;
     CACHE.ts = now;
     CACHE.error = null;
+    console.log("[CACHE] Data fetched and updated successfully.");
   } catch (err) {
     CACHE.error = err && err.message ? err.message : String(err);
     // don't wipe old data on transient error
-    console.warn("[CACHE] fetch error:", CACHE.error);
+    console.warn("[CACHE] Fetch error:", CACHE.error);
   }
 }
-// initial
+
+// Initial fetch on startup
 refreshCacheIfNeeded();
-// also background refresh periodically (best-effort)
-setInterval(() => { refreshCacheIfNeeded().catch(()=>{}); }, CACHE_TTL_MS);
+
+// Background refresh periodically
+setInterval(() => {
+  refreshCacheIfNeeded().catch((e) => console.error("Periodic refresh error:", e));
+}, CACHE_TTL_MS);
 
 // ---------------------- UTILS ----------------------
 function normResult(v) {
   if (v == null) return null;
   const s = String(v).trim().toLowerCase();
-  if (["t", "tai", "tài", "tài"].includes(s)) return "T";
-  if (["x", "xiu", "xỉu", "xiu"].includes(s)) return "X";
+  if (["t", "tai", "tài"].includes(s)) return "T";
+  if (["x", "xiu", "xỉu"].includes(s)) return "X";
   return null;
 }
 function lastN(arr, n) {
@@ -114,7 +120,7 @@ function getPatternType(entry) {
   const [a, b, c] = entry.dice;
   if (a === b && b === c) return `triple_${a}`;
   if (a === b || b === c || a === c) return "pair";
-  const s = [a, b, c].sort((x, y) => x - y);
+  const s = [...entry.dice].sort((x, y) => x - y);
   if (s[0] + 1 === s[1] && s[1] + 1 === s[2]) return "straight";
   return "diff";
 }
@@ -240,6 +246,8 @@ function markovPrediction(hist) {
     if (p === "X" && c === "T") xt++; if (p === "X" && c === "X") xx++;
   }
   const last = use.at(-1);
+  if (!last) return { pred: null, conf: 0.5, why: ["Không đủ dữ liệu cho Markov"] };
+  
   let pT = 0.5, pX = 0.5, why = [];
   if (last === "T") { pT = tt / (tt + tx); pX = tx / (tt + tx); why.push(`Markov từ T: P(T)=${pT.toFixed(2)}`); }
   else { pT = xt / (xt + xx); pX = xx / (xt + xx); why.push(`Markov từ X: P(T)=${pT.toFixed(2)}`); }
@@ -290,6 +298,8 @@ function breakStreakFilter(hist) {
   const rs = hist.map((h) => h.ket_qua);
   const s = streakOfEnd(rs);
   const cur = rs.at(-1);
+  if (!cur) return { pred: null, conf: 0.5, why: ["Không đủ dữ liệu cho BreakStreak"] };
+  
   let breakProb = 0;
   if (s >= 12) breakProb = 0.86;
   else if (s >= 9) breakProb = 0.78;
@@ -415,7 +425,7 @@ function ensemblePredictOptimized(hist) {
       const out = m.fn(hist) || {};
       return { name: m.name, pred: out.pred, conf: out.conf || 0.5, why: out.why || [], meta: out.meta || {} };
     } catch (e) {
-      return { name: m.name, pred: null, conf: 0.5, why: ["error"], meta: {} };
+      return { name: m.name, pred: null, conf: 0.5, why: [`lỗi: ${e.message}`], meta: {} };
     }
   });
 
@@ -464,7 +474,7 @@ function ensemblePredictOptimized(hist) {
   const streak = streakOfEnd(rs);
   const transitions = { "T->T": 0, "T->X": 0, "X->T": 0, "X->X": 0, total: 0 };
   for (let i = 1; i < rs.length; i++) {
-    transitions[`${rs[i - 1]}->${rs[i]}`] += 1;
+    transitions[`${rs[i - 1]}->${rs[i]}`] = (transitions[`${rs[i - 1]}->${rs[i]}`] || 0) + 1;
     transitions.total++;
   }
   const transProb = {};
@@ -552,7 +562,8 @@ app.get("/api/du-doan", async (req, res) => {
     const tyLe = Math.round(bt.acc * 100);
 
     const modelLines = ensemble.modelStats.map((m) => {
-      return `${m.name}: pred=${m.pred === "T" ? "Tài" : m.pred === "X" ? "Xỉu" : "?"}, conf=${m.conf}, weight=${m.weight}, note=${(m.why || []).join("; ")}`;
+      const predText = m.pred === "T" ? "Tài" : m.pred === "X" ? "Xỉu" : "?";
+      return `${m.name}: pred=${predText}, conf=${m.conf}, weight=${m.weight}, note=${(m.why || []).join("; ")}`;
     });
 
     const giai_thich = [
@@ -639,6 +650,6 @@ app.get("/api/du-doan/full", async (req, res) => {
 });
 
 // ---------------------- START ----------------------
-app.listen(PORT, () => {
-  console.log(`VIP-Ultimate API đang chạy tại http://0.0.0.0:${PORT}  (SOURCE_URL=${SOURCE_URL})`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`VIP-Ultimate API đang chạy tại http://0.0.0.0:${PORT} (SOURCE_URL=${SOURCE_URL})`);
 });
