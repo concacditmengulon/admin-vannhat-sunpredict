@@ -15,7 +15,7 @@ function normResult(v) {
   if (v == null) return null;
   const s = String(v).trim().toLowerCase();
   if (["t", "tai", "tài"].includes(s)) return "T";
-  if (["x", "xiu", "xỉu", "xỉu"].includes(s)) return "X";
+  if (["x", "xiu", "xỉu", "xiu"].includes(s)) return "X";
   return null;
 }
 function lastN(arr, n) {
@@ -38,6 +38,27 @@ function streakOfEnd(arr) {
     else break;
   }
   return s;
+}
+
+// New utility: entropy of binary sequence
+function entropy(arr) {
+  if (!arr || !arr.length) return 0;
+  const pT = arr.filter(r => r === "T").length / arr.length;
+  const pX = 1 - pT;
+  return - (pT * Math.log2(pT + 1e-10) + pX * Math.log2(pX + 1e-10));
+}
+
+// New utility: autocorrelation lag k
+function autocorr(arr, lag = 1) {
+  if (!arr || arr.length < lag + 1) return 0;
+  const mean = avg(arr);
+  const var_ = sum(arr.map(v => (v - mean) ** 2)) / arr.length;
+  if (var_ === 0) return 0;
+  let cov = 0;
+  for (let i = lag; i < arr.length; i++) {
+    cov += (arr[i] - mean) * (arr[i - lag] - mean);
+  }
+  return cov / (arr.length - lag) / var_;
 }
 
 // ---------------------- LAYER 0: LOAD & SHAPE ----------------------
@@ -71,15 +92,18 @@ function shapeHistory(raw) {
 function rulesPrediction(hist) {
   const results = hist.map((h) => h.ket_qua);
   const totals = hist.map((h) => h.tong);
+  const dices = hist.map((h) => h.dice);
   const last = results.at(-1);
   const last3 = lastN(results, 3);
   const last5 = lastN(results, 5);
   const total3 = lastN(totals, 3);
-  const total5 = lastN(totals, 5);
+  const last5total = lastN(totals, 5);
+  const last5dices = lastN(dices, 5);
 
   let explain = [];
   let score = { T: 0, X: 0 };
 
+  // Existing rules
   if (last5.filter((r) => r === "T").length >= 4) {
     return { pred: "T", conf: 0.86, why: ["5 phiên gần nhất nghiêng Tài (≥4/5)"] };
   }
@@ -103,7 +127,7 @@ function rulesPrediction(hist) {
     };
   }
 
-  const avg5 = total5.length ? avg(total5) : 10.5;
+  const avg5 = last5total.length ? avg(last5total) : 10.5;
   if (avg5 >= 12) {
     score.T += 2;
     explain.push("Trung bình tổng 5 phiên cao (≥12) → Tài");
@@ -131,13 +155,45 @@ function rulesPrediction(hist) {
     score.X += 3;
     explain.push("Tổng gần nhất rất thấp (≤6) → Xỉu mạnh");
   }
-  if (total5.length === 5 && total5.every((t) => t >= 12)) {
+  if (last5total.length === 5 && last5total.every((t) => t >= 12)) {
     score.T += 3;
     explain.push("5 phiên liên tiếp tổng cao (≥12) → Tài");
   }
-  if (total5.length === 5 && total5.every((t) => t <= 9)) {
+  if (last5total.length === 5 && last5total.every((t) => t <= 9)) {
     score.X += 3;
     explain.push("5 phiên liên tiếp tổng thấp (≤9) → Xỉu");
+  }
+
+  // New rules: Parity
+  const parity5 = lastN(totals, 5).filter(t => t % 2 === 0).length / 5;
+  if (parity5 >= 0.8) {
+    score.X += 1.5;
+    explain.push("Tỷ lệ chẵn cao trong 5 phiên → nghiêng Xỉu (bias pattern)");
+  } else if (parity5 <= 0.2) {
+    score.T += 1.5;
+    explain.push("Tỷ lệ lẻ cao trong 5 phiên → nghiêng Tài (bias pattern)");
+  }
+
+  // New rules: Dice pattern
+  const avgDice5 = avg(last5dices.flat().slice(-15)); // avg of last 15 dice faces
+  if (avgDice5 >= 3.8) {
+    score.T += 2.5;
+    explain.push("Trung bình mặt xúc xắc cao (≥3.8) trong 5 phiên → Tài");
+  } 
+  if (avgDice5 <= 3.2) {
+    score.X += 2.5;
+    explain.push("Trung bình mặt xúc xắc thấp (≤3.2) trong 5 phiên → Xỉu");
+  }
+
+  // New rules: Extended streak
+  const s = streakOfEnd(results);
+  if (s >= 4 && s < 6) {
+    score[last === "T" ? "X" : "T"] += 2;
+    explain.push(`Chuỗi 4-5 → ưu tiên đảo chiều`);
+  } 
+  if (s >= 6) {
+    score[last] += 1;
+    explain.push(`Chuỗi dài ≥6 → theo chiều (rare bias)`);
   }
 
   let pred = null;
@@ -174,10 +230,9 @@ function rulesPrediction(hist) {
 function markovPrediction(hist) {
   const rs = hist.map((h) => h.ket_qua);
   const use = lastN(rs, 60);
-  let tt = 1,
-    tx = 1,
-    xt = 1,
-    xx = 1;
+  let tt = 1, tx = 1, xt = 1, xx = 1;
+  // Higher order: TT, TX, XT, XX as states for lag2
+  let tt_t = 1, tt_x = 1, tx_t = 1, tx_x = 1, xt_t = 1, xt_x = 1, xx_t = 1, xx_x = 1;
 
   for (let i = 1; i < use.length; i++) {
     const prev = use[i - 1];
@@ -188,20 +243,45 @@ function markovPrediction(hist) {
     if (prev === "X" && cur === "X") xx++;
   }
 
+  for (let i = 2; i < use.length; i++) {
+    const prev2 = use[i - 2] + use[i - 1];
+    const cur = use[i];
+    if (prev2 === "TT" && cur === "T") tt_t++;
+    if (prev2 === "TT" && cur === "X") tt_x++;
+    if (prev2 === "TX" && cur === "T") tx_t++;
+    if (prev2 === "TX" && cur === "X") tx_x++;
+    if (prev2 === "XT" && cur === "T") xt_t++;
+    if (prev2 === "XT" && cur === "X") xt_x++;
+    if (prev2 === "XX" && cur === "T") xx_t++;
+    if (prev2 === "XX" && cur === "X") xx_x++;
+  }
+
   const last = use.at(-1);
-  let pT = 0.5,
-    pX = 0.5,
-    why = [];
-  if (last === "T") {
-    const s = tt + tx;
-    pT = tt / s;
-    pX = tx / s;
-    why.push(`Markov từ T: P(T)=${pT.toFixed(2)}, P(X)=${pX.toFixed(2)}`);
-  } else if (last === "X") {
-    const s = xt + xx;
-    pT = xt / s;
-    pX = xx / s;
-    why.push(`Markov từ X: P(T)=${pT.toFixed(2)}, P(X)=${pX.toFixed(2)}`);
+  const last2 = use.length >= 2 ? use.at(-2) + last : null;
+
+  let pT = 0.5, pX = 0.5, why = [];
+  if (use.length >= 2 && last2) {
+    // Use lag2 if available
+    let s, pt, px;
+    if (last2 === "TT") { s = tt_t + tt_x; pt = tt_t / s; px = tt_x / s; }
+    else if (last2 === "TX") { s = tx_t + tx_x; pt = tx_t / s; px = tx_x / s; }
+    else if (last2 === "XT") { s = xt_t + xt_x; pt = xt_t / s; px = xt_x / s; }
+    else if (last2 === "XX") { s = xx_t + xx_x; pt = xx_t / s; px = xx_x / s; }
+    pT = pt;
+    pX = px;
+    why.push(`Higher-order Markov từ ${last2}: P(T)=${pT.toFixed(2)}, P(X)=${pX.toFixed(2)}`);
+  } else {
+    // Fallback to lag1
+    if (last === "T") {
+      const s = tt + tx;
+      pT = tt / s;
+      pX = tx / s;
+    } else if (last === "X") {
+      const s = xt + xx;
+      pT = xt / s;
+      pX = xx / s;
+    }
+    why.push(`Markov từ ${last}: P(T)=${pT.toFixed(2)}, P(X)=${pX.toFixed(2)}`);
   }
 
   const pred = pT >= pX ? "T" : "X";
@@ -214,6 +294,7 @@ function recentPatternPrediction(hist) {
   const use = lastN(rs, 20);
   let why = [];
 
+  // Extended to pattern 5
   const pat3Counts = {};
   for (let i = 0; i <= use.length - 3; i++) {
     const k = use.slice(i, i + 3).join("");
@@ -224,6 +305,11 @@ function recentPatternPrediction(hist) {
     const k = use.slice(i, i + 4).join("");
     pat4Counts[k] = (pat4Counts[k] || 0) + 1;
   }
+  const pat5Counts = {};
+  for (let i = 0; i <= use.length - 5; i++) {
+    const k = use.slice(i, i + 5).join("");
+    pat5Counts[k] = (pat5Counts[k] || 0) + 1;
+  }
 
   function bestEntry(obj) {
     return Object.entries(obj).sort((a, b) => b[1] - a[1])[0];
@@ -231,20 +317,27 @@ function recentPatternPrediction(hist) {
 
   const b3 = bestEntry(pat3Counts);
   const b4 = bestEntry(pat4Counts);
+  const b5 = bestEntry(pat5Counts);
 
   let pred = null;
   let conf = 0.58;
 
-  if (b4 && b4[1] >= 3) {
+  if (b5 && b5[1] >= 2) {
+    const patt = b5[0];
+    const next = patt[4];
+    pred = next;
+    conf = 0.75 + Math.min(0.15, (b5[1] - 2) * 0.05);
+    why.push(`Pattern 5 bước lặp nhiều: ${patt} x${b5[1]}`);
+  } else if (b4 && b4[1] >= 3) {
     const patt = b4[0];
     const next = patt[3];
-    pred = next === "T" ? "T" : "X";
+    pred = next;
     conf = 0.72 + Math.min(0.12, (b4[1] - 3) * 0.04);
     why.push(`Pattern 4 bước lặp nhiều: ${patt} x${b4[1]}`);
   } else if (b3 && b3[1] >= 4) {
     const patt = b3[0];
     const next = patt[2];
-    pred = next === "T" ? "T" : "X";
+    pred = next;
     conf = 0.68 + Math.min(0.1, (b3[1] - 4) * 0.03);
     why.push(`Pattern 3 bước lặp nhiều: ${patt} x${b3[1]}`);
   } else {
@@ -265,17 +358,41 @@ function breakStreakFilter(hist) {
   const s = streakOfEnd(rs);
   const cur = rs.at(-1);
 
+  // Improved with historical break rate
+  let historicalBreak = 0;
+  let streakCounts = {3:0, 4:0, 5:0, 6:0, 7:0, 8:0};
+  let breakCounts = {3:0, 4:0, 5:0, 6:0, 7:0, 8:0};
+  let currentStreak = 1;
+  for (let i = 1; i < rs.length; i++) {
+    if (rs[i] === rs[i-1]) {
+      currentStreak++;
+    } else {
+      if (currentStreak >= 3) {
+        streakCounts[currentStreak] = (streakCounts[currentStreak] || 0) + 1;
+        breakCounts[currentStreak] = (breakCounts[currentStreak] || 0) + 1; // assume break at end
+      }
+      currentStreak = 1;
+    }
+  }
+  if (currentStreak >= 3) streakCounts[currentStreak] = (streakCounts[currentStreak] || 0) + 1; // current not broken yet
+
   let breakProb = 0;
   if (s >= 8) breakProb = 0.78;
   else if (s >= 6) breakProb = 0.7;
   else if (s >= 4) breakProb = 0.62;
+  else if (s >= 3) breakProb = 0.55;
+
+  // Adjust with historical
+  if (s >= 3 && streakCounts[s] > 0) {
+    breakProb = (breakCounts[s] / streakCounts[s]) || breakProb;
+  }
 
   if (breakProb >= 0.62) {
     const pred = cur === "T" ? "X" : "T";
     return {
       pred,
       conf: breakProb,
-      why: [`Chuỗi ${s} ${cur === "T" ? "Tài" : "Xỉu"} → xác suất bẻ cầu ${Math.round(breakProb * 100)}%`],
+      why: [`Chuỗi ${s} ${cur === "T" ? "Tài" : "Xỉu"} → xác suất bẻ cầu ${Math.round(breakProb * 100)}% (historical adjusted)`],
     };
   }
   return {
@@ -285,13 +402,33 @@ function breakStreakFilter(hist) {
   };
 }
 
+// New model: Simple AR(2) for totals prediction
+function arPrediction(hist) {
+  const totals = hist.map(h => h.tong);
+  const use = lastN(totals, 30);
+  if (use.length < 3) return { pred: "T", conf: 0.5, why: ["Không đủ dữ liệu cho AR"] };
+
+  // Simple AR(2): next = a1 * last + a2 * last2 + c
+  // Simple approximation for AR(2): a1 = 0.6, a2 = 0.3, c = avg(use) * (1-0.6-0.3)
+  const a1 = 0.6;
+  const a2 = 0.3;
+  const c = avg(use) * (1 - a1 - a2);
+  const nextTotal = a1 * use.at(-1) + a2 * use.at(-2) + c;
+
+  const pred = nextTotal > 10.5 ? "T" : "X";
+  const conf = 0.6 + Math.min(0.2, Math.abs(nextTotal - 10.5) / 7.5);
+  const why = [`AR(2) dự đoán tổng tiếp theo ~${nextTotal.toFixed(1)} → ${pred}`];
+  return { pred, conf, why };
+}
+
 // ---------------------- ENSEMBLE: LOGISTIC ONLINE + HEURISTIC ----------------------
 
-// feature extractor for logistic ensemble
+// Feature extractor with new features
 function extractFeaturesForEnsemble(hist) {
   const N = hist.length;
   const rs = hist.map(h => h.ket_qua);
   const totals = hist.map(h => h.tong);
+  const dices = hist.map(h => h.dice);
 
   const last5 = lastN(rs, 5);
   const last10 = lastN(rs, 10);
@@ -318,6 +455,13 @@ function extractFeaturesForEnsemble(hist) {
   const r3 = recentPatternPrediction(hist);
   const r4 = breakStreakFilter(hist);
 
+  // New features
+  const entropy10 = entropy(lastN(rs, 10));
+  const lag1 = autocorr(lastN(totals, 20), 1);
+  const lag2 = autocorr(lastN(totals, 20), 2);
+  const avgDice5 = avg(lastN(dices, 5).flat()) / 3.5; // normalized to mean 3.5
+  const highDiceFreq5 = lastN(dices, 5).flat().filter(d => d > 3).length / 15; // 15 dice
+
   return {
     f_freqT_5: freqT_5,
     f_freqT_10: freqT_10,
@@ -331,6 +475,11 @@ function extractFeaturesForEnsemble(hist) {
     model_r2_T: r2.pred === 'T' ? r2.conf : 1 - r2.conf,
     model_r3_T: r3.pred === 'T' ? r3.conf : 1 - r3.conf,
     model_r4_T: r4.pred === 'T' ? r4.conf : 1 - r4.conf,
+    f_entropy10: entropy10,
+    f_lag1: lag1,
+    f_lag2: lag2,
+    f_avgDice5: avgDice5,
+    f_highDice5: highDiceFreq5,
   };
 }
 
@@ -350,9 +499,9 @@ function markovTransitionFeature(rs) {
   const s=xt+xx; return { pT: xt/s, pX: xx/s };
 }
 
-// Online logistic classifier
+// Online logistic
 class OnlineLogisticEnsemble {
-  constructor(featureKeys, lr = 0.02, reg = 1e-3) {
+  constructor(featureKeys, lr = 0.03, reg = 1e-3) { // Increased lr for faster learning
     this.keys = featureKeys;
     this.lr = lr;
     this.reg = reg;
@@ -364,14 +513,13 @@ class OnlineLogisticEnsemble {
 
   _dot(features) {
     let s = this.bias;
-    this.keys.forEach(k => { s += (this.w[k] || 0) * (features[k] || 0);});
+    this.keys.forEach(k => { s += (this.w[k] || 0) * (features[k] || 0); });
     return s;
   }
 
   predictProb(features) {
     const z = this._dot(features);
-    const p = 1 / (1 + Math.exp(-z));
-    return p;
+    return 1 / (1 + Math.exp(-z));
   }
 
   update(features, label) {
@@ -399,18 +547,18 @@ class OnlineLogisticEnsemble {
 
 const ensembleFeatureKeys = [
   'f_freqT_5','f_freqT_10','f_avg5','f_avg10','f_run','f_switch12','f_parity5',
-  'm_markov_Tprob','model_r1_T','model_r2_T','model_r3_T','model_r4_T'
+  'm_markov_Tprob','model_r1_T','model_r2_T','model_r3_T','model_r4_T',
+  'f_entropy10','f_lag1','f_lag2','f_avgDice5','f_highDice5' // New keys
 ];
-const LOGISTIC_ENSEMBLE = new OnlineLogisticEnsemble(ensembleFeatureKeys, 0.02, 1e-3);
+const LOGISTIC_ENSEMBLE = new OnlineLogisticEnsemble(ensembleFeatureKeys, 0.03, 1e-3);
 
-// ensemblePredict wrapper
+// ensemblePredict with new AR vote
 function ensemblePredict(hist) {
   if (!hist || hist.length < 5) {
-    // fallback trivial
     return { pred: hist.at(-1)?.ket_qua || "T", conf: 0.55, why: ["Không đủ dữ liệu, fallback"] };
   }
 
-  // warm logistic on first pass
+  // Warm
   if (hist.length > 120 && !LOGISTIC_ENSEMBLE._warmed) {
     LOGISTIC_ENSEMBLE.batchFitWalkForward(hist, extractFeaturesForEnsemble, 60);
   }
@@ -421,18 +569,19 @@ function ensemblePredict(hist) {
   const predLog = pT >= pX ? 'T' : 'X';
   const confLog = Math.max(pT, pX);
 
-  // heuristic ensemble as second opinion
   const r1 = rulesPrediction(hist);
   const r2 = markovPrediction(hist);
   const r3 = recentPatternPrediction(hist);
   const r4 = breakStreakFilter(hist);
+  const r5 = arPrediction(hist); // New AR vote
 
   const votes = [
     { p: r1.pred, c: r1.conf * 0.25, why: r1.why },
     { p: r2.pred, c: r2.conf * 0.2, why: r2.why },
     { p: r3.pred, c: r3.conf * 0.3, why: r3.why },
     { p: r4.pred, c: r4.conf * 0.15, why: r4.why },
-    { p: predLog, c: confLog * 0.4, why: [`Logistic ensemble pT=${pT.toFixed(3)}`] }
+    { p: r5.pred, c: r5.conf * 0.1, why: r5.why }, // New
+    { p: predLog, c: confLog * 0.45, why: [`Logistic ensemble pT=${pT.toFixed(3)}`] } // Increased weight
   ];
 
   const scoreT = sum(votes.map(v => v.p === 'T' ? v.c : 0));
@@ -451,40 +600,42 @@ function ensemblePredict(hist) {
 
 function overallBacktest(hist, lookback = 100, betUnit = 1) {
   const n = Math.min(lookback, hist.length - 1);
-  if (n <= 10) return { acc: 0, sample: n, bankroll: null, details: [] };
+  if (n <= 10) return { acc: 0, sample: n, bankroll: null, roi: 0, maxDrawdown: 0, details: [] };
 
   let correct = 0;
   let bankroll = 1000;
+  let peak = bankroll;
+  let maxDrawdown = 0;
   const details = [];
   for (let i = hist.length - 1 - n; i < hist.length - 1; i++) {
     const past = hist.slice(0, i+1);
     const res = ensemblePredict(past);
     const actualNext = hist[i+1].ket_qua;
-    const betSize = kellyBetSize(res.conf, 0.95, bankroll, betUnit); // suggested bet
-    // simplified payout: 1:1 on win
+    const betSize = kellyBetSize(res.conf, 0.95, bankroll, betUnit);
     if (res.pred === actualNext) {
       correct++;
       bankroll += betSize;
     } else {
       bankroll -= betSize;
     }
+    if (bankroll > peak) peak = bankroll;
+    const dd = (peak - bankroll) / peak;
+    if (dd > maxDrawdown) maxDrawdown = dd;
     details.push({ idx: i+1, pred: res.pred, actual: actualNext, conf: res.conf, bet: betSize, bankroll: bankroll });
   }
   const acc = correct / n;
-  return { acc, sample: n, bankroll, details: details.slice(-200) };
+  const roi = (bankroll - 1000) / 1000;
+  return { acc, sample: n, bankroll, roi, maxDrawdown, details: details.slice(-200) };
 }
 
 function kellyBetSize(confidence, payout = 0.95, bankroll = 1000, baseUnit = 1) {
-  // confidence: prob of win (0..1). payout: net odds (e.g., 0.95 for near even)
-  // Kelly fraction = (bp - q)/b where b = payout, p=confidence, q=1-p
   const p = Math.max(0.01, Math.min(0.99, confidence));
   const b = payout;
   const q = 1 - p;
   const k = (b * p - q) / b;
-  if (k <= 0) return baseUnit; // no edge -> minimal unit
-  // cap fraction to avoid overbetting
-  const frac = Math.min(0.2, k); // max 20% bankroll on single bet
-  return Math.max(1, Math.round(bankroll * frac)); // at least 1 unit
+  if (k <= 0) return baseUnit;
+  const frac = Math.min(0.2, k);
+  return Math.max(1, Math.round(bankroll * frac));
 }
 
 // ---------------------- RISK LEVEL ----------------------
@@ -498,10 +649,12 @@ function riskLevel(conf, hist) {
   }
   const switchRate = last12.length > 1 ? switches / (last12.length - 1) : 0.5;
   const s = streakOfEnd(rs);
+  const ent = entropy(lastN(rs, 10));
 
   let risk = 1 - conf;
   risk += switchRate * 0.15;
   if (s >= 6) risk += 0.05;
+  if (ent > 0.9) risk += 0.1; // High entropy -> high risk
 
   if (risk <= 0.22) return "Thấp";
   if (risk <= 0.35) return "Trung bình";
